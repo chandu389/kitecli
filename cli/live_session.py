@@ -292,6 +292,16 @@ class KCLILiveSession:
         #   NSE:NIFTY 50 -> 256265, BSE:SENSEX -> 265, NSE:INDIA VIX -> 264969
         self.index_tokens = {256265: "nifty", 265: "sensex", 264969: "vix"}
         self.index_values = {"nifty": None, "sensex": None, "vix": None}
+
+        # Designated primary streaming account. Index and option-chain ticks are
+        # subscribed only on this account's ticker (chosen in
+        # _initial_fetch_and_connect) so we don't redundantly stream the same
+        # instruments on every account.
+        self.primary_api_key = None
+        # Option-chain streaming state.
+        self.oc_data = None            # structured {underlying, expiry, strikes, ...}
+        self.oc_token_map = {}         # instrument_token -> (strike_value, "ce"|"pe")
+        self.oc_subscribed_tokens = set()
         
         # In-memory store of active positions used to resolve partial symbols
         self.active_positions = []
@@ -709,6 +719,34 @@ class KCLILiveSession:
             )
         return statuses
 
+    def _select_primary_account(self, token_statuses: dict[str, str]) -> str | None:
+        """Pick the primary streaming account.
+
+        Preference order:
+          1. A config account explicitly flagged ``primary: true`` — but only if
+             it is stream-capable (token status ``valid``).
+          2. Otherwise the first stream-capable account in config order.
+
+        Returns the api_key, or ``None`` if no account can stream.
+        """
+        def streamable(acct) -> bool:
+            return token_statuses.get(acct.get("api_key")) == "valid"
+
+        flagged = [a for a in self.accounts if a.get("primary")]
+        for acct in flagged:
+            if streamable(acct):
+                return acct.get("api_key")
+        if flagged:
+            self.log_message(
+                f"[#ff8700]Configured primary @{flagged[0].get('name')} cannot "
+                f"stream;[/#] falling back to another stream-capable account."
+            )
+
+        for acct in self.accounts:
+            if streamable(acct):
+                return acct.get("api_key")
+        return None
+
     async def _initial_fetch_and_connect(self) -> None:
         """Initial fetch of data and connect all WebSockets."""
         self.log_message("Initializing connections and fetching data...")
@@ -722,6 +760,20 @@ class KCLILiveSession:
         # used for the WebSocket ticker, so a REST 403/expired here explains the
         # "1006 / 403 Forbidden" handshake failures.
         token_statuses = await self._diagnose_tokens()
+
+        # Choose the primary streaming account (used for index + option-chain
+        # streaming). Index/OC ticks are subscribed only on this account.
+        self.primary_api_key = self._select_primary_account(token_statuses)
+        if self.primary_api_key:
+            self.log_message(
+                f"[#58a6ff]Primary streaming account:[/#] "
+                f"@{self._get_account_name(self.primary_api_key)}"
+            )
+        else:
+            self.log_message(
+                "[#ff8700]No stream-capable account:[/#] indices and option "
+                "chain will use REST snapshots only (no live streaming)."
+            )
 
         # Connect WebSockets for all accounts
         from kiteconnect import KiteTicker
@@ -785,9 +837,13 @@ class KCLILiveSession:
         def on_connect(ws, response):
             name = self._get_account_name(api_key)
             self.log_message(f"[#00ff00]WebSocket connected:[/#] @{name}")
-            # Subscribe to position tokens plus the market index tokens so the
-            # NIFTY/SENSEX/INDIA VIX header streams live.
-            tokens = set(self.subscribed_tokens) | set(self.index_tokens)
+            # Every account streams its own position tokens.
+            tokens = set(self.subscribed_tokens)
+            # Index and option-chain tokens stream only on the primary account
+            # to avoid redundant duplicate subscriptions across accounts.
+            if api_key == self.primary_api_key:
+                tokens |= set(self.index_tokens)
+                tokens |= set(self.oc_subscribed_tokens)
             if tokens:
                 token_list = list(tokens)
                 ticker.subscribe(token_list)
@@ -841,6 +897,7 @@ class KCLILiveSession:
     def _on_ticks(self, ws, ticks):
         updated = False
         indices_updated = False
+        oc_updated = False
         for tick in ticks:
             token = tick.get("instrument_token")
             ltp = tick.get("last_price")
@@ -851,6 +908,16 @@ class KCLILiveSession:
             if token in self.index_tokens:
                 self.index_values[self.index_tokens[token]] = ltp
                 indices_updated = True
+                continue
+
+            # Option-chain tick → update the matching strike's CE/PE LTP.
+            if token in self.oc_token_map and self.oc_data:
+                strike_val, side = self.oc_token_map[token]
+                for s in self.oc_data.get("strikes", []):
+                    if s.get("strike") == strike_val:
+                        s[f"{side}_ltp"] = ltp
+                        oc_updated = True
+                        break
                 continue
 
             if ltp:
@@ -875,6 +942,9 @@ class KCLILiveSession:
         
         if indices_updated and hasattr(self, "app") and self.app and self.app.loop:
             self.app.loop.call_soon_threadsafe(self._refresh_indices_header)
+
+        if oc_updated and hasattr(self, "app") and self.app and self.app.loop:
+            self.app.loop.call_soon_threadsafe(self._update_oc_and_invalidate)
 
         if updated:
             self._positions_version = getattr(self, "_positions_version", 0) + 1
@@ -1696,11 +1766,12 @@ class KCLILiveSession:
                         self.log_message(f"[#ff0000]Error:[/#] Unknown option '{parts[2]}'. Use 'week <N>' or 'YYYY-MM-DD'.")
                         return
 
-            # Need an api_key to call the server — use first available account
+            # Use the primary streaming account so the option chain can stream;
+            # fall back to the first configured account for the REST fetch.
             if not self.accounts:
                 self.log_message("[#ff0000]Error:[/#] No accounts configured.")
                 return
-            api_key = self.accounts[0]["api_key"]
+            api_key = self.primary_api_key or self.accounts[0]["api_key"]
 
             self.log_message(f"Fetching option chain for [bold]{underlying}[/bold] (expiry_week={expiry_week if not expiry_date else expiry_date})...")
             asyncio.create_task(self._fetch_and_display_option_chain(api_key, underlying, expiry_week, expiry_date))
@@ -1742,7 +1813,38 @@ class KCLILiveSession:
         strikes = response.get("strikes", [])
         expiries = response.get("available_expiries", [])
 
-        # Build rich text for the info pane
+        # Store structured data so streaming ticks can update LTPs in place and
+        # the pane can be re-rendered without another REST fetch.
+        self.oc_data = {
+            "underlying": underlying,
+            "expiry": expiry,
+            "strikes": strikes,
+            "available_expiries": expiries,
+        }
+
+        # Subscribe the option tokens on the primary ticker so the LTPs stream.
+        self._update_oc_subscriptions(strikes)
+
+        self._last_oc_text = self._render_oc_text()
+        self.info_mode = "oc"
+        self._update_info_buffer()
+        stream_note = " (streaming)" if self.primary_api_key else ""
+        self.log_message(
+            f"Option chain loaded for {underlying} expiry {expiry}{stream_note}. "
+            f"Press F3 to view in right pane."
+        )
+
+    def _render_oc_text(self) -> str:
+        """Render the current ``self.oc_data`` into the option-chain pane text."""
+        data = self.oc_data
+        if not data:
+            return self._last_oc_text
+
+        underlying = data.get("underlying", "")
+        expiry = data.get("expiry", "")
+        strikes = data.get("strikes", [])
+        expiries = data.get("available_expiries", [])
+
         lines = [
             f"=== Option Chain: {underlying}  |  Expiry: {expiry} ===",
             "",
@@ -1770,11 +1872,60 @@ class KCLILiveSession:
             lines.append(f"  [{e['week_label']}]  {e['expiry']}")
         lines.append("")
         lines.append("Tip: To buy CE, type: buy <CE_SYMBOL> <qty>")
+        return "\n".join(lines)
 
-        self._last_oc_text = "\n".join(lines)
-        self.info_mode = "oc"
-        self._update_info_buffer()
-        self.log_message(f"Option chain loaded for {underlying} expiry {expiry}. Press F3 to view in right pane.")
+    def _update_oc_subscriptions(self, strikes: list[dict]) -> None:
+        """Subscribe the option-chain instrument tokens on the primary ticker
+        (unsubscribing any tokens from a previously displayed chain).
+
+        Also rebuilds ``self.oc_token_map`` so incoming ticks can be routed to
+        the correct strike/side for live LTP updates.
+        """
+        new_tokens: set[int] = set()
+        token_map: dict[int, tuple] = {}
+        for s in strikes:
+            ce_tok = s.get("ce_token")
+            pe_tok = s.get("pe_token")
+            if ce_tok:
+                new_tokens.add(int(ce_tok))
+                token_map[int(ce_tok)] = (s.get("strike"), "ce")
+            if pe_tok:
+                new_tokens.add(int(pe_tok))
+                token_map[int(pe_tok)] = (s.get("strike"), "pe")
+
+        self.oc_token_map = token_map
+
+        ticker = self.tickers.get(self.primary_api_key) if self.primary_api_key else None
+        old_tokens = self.oc_subscribed_tokens
+
+        # Don't unsubscribe tokens that are also position/index tokens.
+        protected = set(self.subscribed_tokens) | set(self.index_tokens)
+        to_unsub = (old_tokens - new_tokens) - protected
+        to_sub = new_tokens - protected
+
+        if ticker:
+            if to_unsub:
+                try:
+                    ticker.unsubscribe(list(to_unsub))
+                except Exception:
+                    pass
+            if to_sub:
+                try:
+                    ticker.subscribe(list(to_sub))
+                    ticker.set_mode(ticker.MODE_LTP, list(to_sub))
+                except Exception:
+                    pass
+
+        self.oc_subscribed_tokens = new_tokens
+
+    def _update_oc_and_invalidate(self) -> None:
+        """Re-render the option-chain pane from streamed values and refresh TUI."""
+        self._last_oc_text = self._render_oc_text()
+        if self.info_mode == "oc":
+            self._update_info_buffer()
+        if hasattr(self, "app") and self.app:
+            self.app.invalidate()
+
 
     def _render_orders_pane(self, response: dict, mode: str) -> str:
         """Render pending or executed orders from a /api/orders response into plain text."""

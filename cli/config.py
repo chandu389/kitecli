@@ -23,6 +23,12 @@ DEFAULT_CONFIG = {
             "password": "your_zerodha_password",
             "totp_secret": "your_totp_secret",
             "proxy": "http://user:pass@host:port",
+            # Optional: mark one account as the primary streaming account. It is
+            # used for market index (NIFTY/SENSEX/INDIA VIX) and option-chain
+            # streaming so those instruments aren't subscribed redundantly on
+            # every account. If omitted (or the flagged account can't stream),
+            # the first stream-capable account is chosen automatically.
+            "primary": True,
         },
     ],
 }

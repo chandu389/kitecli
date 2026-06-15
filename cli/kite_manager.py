@@ -759,14 +759,18 @@ class KiteAccountManager:
             except Exception as exc:
                 logger.warning("Failed to fetch LTP for option chain: %s", exc)
 
-        # Enrich each strike entry with live LTP
+        # Enrich each strike entry with live LTP and instrument tokens. The
+        # tokens let the live TUI subscribe to these options on the WebSocket so
+        # the option-chain LTPs can stream rather than being a one-shot snapshot.
         for s in strikes:
             ce_key = f"NFO:{s.get('ce_symbol', '')}"
             pe_key = f"NFO:{s.get('pe_symbol', '')}"
             if ce_key in ltp_data:
                 s["ce_ltp"] = ltp_data[ce_key].get("last_price")
+                s["ce_token"] = ltp_data[ce_key].get("instrument_token")
             if pe_key in ltp_data:
                 s["pe_ltp"] = ltp_data[pe_key].get("last_price")
+                s["pe_token"] = ltp_data[pe_key].get("instrument_token")
 
         logger.info(
             "Option chain: %s, expiry=%s, strikes=%d",
