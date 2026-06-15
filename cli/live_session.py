@@ -837,13 +837,21 @@ class KCLILiveSession:
         def on_connect(ws, response):
             name = self._get_account_name(api_key)
             self.log_message(f"[#00ff00]WebSocket connected:[/#] @{name}")
-            # Every account streams its own position tokens.
+            # All market-data (position prices, indices, option chain) streams on
+            # the primary ticker only — instrument prices are global, so there's
+            # no need to subscribe them on every account. Non-primary tickers
+            # stay connected purely for their own order-update postbacks, which
+            # require no subscription.
+            is_primary = api_key == self.primary_api_key
+            # If no primary was selected, fall back to the first connected ticker
+            # so position prices still stream somewhere.
+            if not self.primary_api_key and self.tickers:
+                is_primary = api_key == next(iter(self.tickers.keys()))
+            if not is_primary:
+                return
             tokens = set(self.subscribed_tokens)
-            # Index and option-chain tokens stream only on the primary account
-            # to avoid redundant duplicate subscriptions across accounts.
-            if api_key == self.primary_api_key:
-                tokens |= set(self.index_tokens)
-                tokens |= set(self.oc_subscribed_tokens)
+            tokens |= set(self.index_tokens)
+            tokens |= set(self.oc_subscribed_tokens)
             if tokens:
                 token_list = list(tokens)
                 ticker.subscribe(token_list)
@@ -979,23 +987,40 @@ class KCLILiveSession:
         )
 
     def _update_subscriptions(self, new_tokens: set[int]) -> None:
-        """Subscribe to new tokens and unsubscribe from inactive ones."""
+        """Subscribe to position instrument tokens and unsubscribe inactive ones.
+
+        Instrument prices are global (the same LTP regardless of which account
+        holds the position), so we stream each token on the **primary** ticker
+        only — not on every account — to avoid receiving the same price tick
+        once per account. The tick handler (`_on_ticks`) then applies each
+        price to all accounts' matching positions, so per-account positions and
+        P&L remain fully independent.
+        """
         to_subscribe = new_tokens - self.subscribed_tokens
         to_unsubscribe = self.subscribed_tokens - new_tokens
         # Never unsubscribe the market index tokens — they must keep streaming.
         to_unsubscribe -= set(self.index_tokens)
-        
-        if to_subscribe:
-            for ticker in self.tickers.values():
-                try:
-                    ticker.subscribe(list(to_subscribe))
-                    ticker.set_mode(ticker.MODE_LTP, list(to_subscribe))
-                except Exception:
-                    pass
-            self.subscribed_tokens.update(to_subscribe)
-            
+        # Keep tokens still needed by the live option chain subscribed.
+        to_unsubscribe -= set(self.oc_subscribed_tokens)
+
+        # Stream position prices on the primary ticker only. Fall back to any
+        # available ticker if no primary was selected (e.g. only non-flagged
+        # stream-capable accounts and selection returned the first one anyway).
+        ticker = self.tickers.get(self.primary_api_key) if self.primary_api_key else None
+        if ticker is None and self.tickers:
+            ticker = next(iter(self.tickers.values()))
+
+        if to_subscribe and ticker is not None:
+            try:
+                ticker.subscribe(list(to_subscribe))
+                ticker.set_mode(ticker.MODE_LTP, list(to_subscribe))
+            except Exception:
+                pass
+        # Track intent even if no ticker is connected yet; on_connect re-subscribes.
+        self.subscribed_tokens.update(to_subscribe)
+
         if to_unsubscribe:
-            for ticker in self.tickers.values():
+            if ticker is not None:
                 try:
                     ticker.unsubscribe(list(to_unsubscribe))
                 except Exception:
