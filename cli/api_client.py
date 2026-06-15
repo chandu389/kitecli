@@ -320,3 +320,7 @@ class KCLIClient:
     def get_market_indices(self) -> dict:
         """Fetch live Nifty, Sensex, and India VIX."""
         return _manager.get_market_indices()
+
+    def get_access_token(self, api_key: str) -> str | None:
+        """Get the access token for an authenticated account."""
+        return _manager.get_access_token(api_key)

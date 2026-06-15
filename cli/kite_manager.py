@@ -209,6 +209,20 @@ class KiteAccountManager:
             "authenticated": self.is_authenticated(api_key),
         }
 
+    def get_access_token(self, api_key: str) -> str | None:
+        """Get the access token for an authenticated account.
+
+        Args:
+            api_key: The Kite Connect API key.
+
+        Returns:
+            The access token string, or None if not authenticated/found.
+        """
+        kite = self._clients.get(api_key)
+        if kite:
+            return getattr(kite, "access_token", None)
+        return None
+
     def get_all_api_keys(self) -> list[str]:
         """Return a list of all registered api_keys."""
         return list(self._clients.keys())

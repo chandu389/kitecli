@@ -198,9 +198,7 @@ def status() -> None:
 
 
 @app.command()
-def live(
-    refresh: int = typer.Option(5, "--refresh", "-r", help="Auto-refresh interval in seconds."),
-) -> None:
+def live() -> None:
     """[bold]Live dashboard[/bold] — Interactive positions monitor and order terminal."""
     config = _load_config_or_exit()
     accounts = config.get("accounts", [])
@@ -210,7 +208,7 @@ def live(
     client = _build_client(config)
 
     # Launch interactive session
-    session = KCLILiveSession(client, accounts, refresh_interval=refresh)
+    session = KCLILiveSession(client, accounts)
     try:
         asyncio.run(session.run())
     except KeyboardInterrupt:

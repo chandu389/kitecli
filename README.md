@@ -36,7 +36,7 @@ pip install kitecli
 
 *(For local development or installing from source)*:
 ```bash
-git clone https://github.com/vgolugur/kitecli.git
+git clone https://github.com/chandu389/kitecli.git
 cd kitecli
 pip install -e .
 ```

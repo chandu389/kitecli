@@ -88,11 +88,12 @@ class ScrollableWindow(Window):
 class KCLILiveSession:
     """Manages the interactive live positions dashboard and trading command line."""
 
-    def __init__(self, client: KCLIClient, accounts: list[dict], refresh_interval: int = 5) -> None:
+    def __init__(self, client: KCLIClient, accounts: list[dict]) -> None:
         self.client = client
         self.accounts = accounts
-        self.refresh_interval = refresh_interval
         self.running = True
+        self.tickers = {}
+        self.subscribed_tokens = set()
         
         # In-memory store of active positions used to resolve partial symbols
         self.active_positions = []
@@ -426,86 +427,191 @@ class KCLILiveSession:
         # Update title bar info
         now = datetime.now().strftime("%H:%M:%S")
         self.header_control.text = (
-            f"🪁 KiteCLI Live │ Refresh: {self.refresh_interval}s │ "
+            f"🪁 KiteCLI Live │ WebSockets Active │ "
             f"Last Update: {now} │ Accounts: {len(self.accounts)} │ "
             f"Ctrl+C: Quit │ Escape: Deselect"
         )
 
-    async def _update_loop(self) -> None:
-        """Coroutine to fetch positions and update the UI periodically."""
-        while self.running:
-            try:
-                # Fetch positions in executor
-                api_keys = [acct["api_key"] for acct in self.accounts]
-                response = await self._run_api_call(self.client.get_positions, api_keys)
+    async def _initial_fetch_and_connect(self) -> None:
+        """Initial fetch of data and connect all WebSockets."""
+        self.log_message("Initializing connections and fetching data...")
+        try:
+            # Perform initial data fetch
+            await self._trigger_immediate_refresh()
+        except Exception as exc:
+            self.log_message(f"[#ff0000]Initial fetch failed:[/#] {exc}")
 
-                # Check if any account failed with "Account not found"
-                has_unregistered = False
-                for acct in response.get("accounts", []):
-                    if "Account not found" in acct.get("status", ""):
-                        has_unregistered = True
-                        break
-
-                if has_unregistered:
-                    self.log_message("[#ffaa00]Account session expired. Re-initializing...[/#]")
-                    await self._run_api_call(self.client.init_accounts, self.accounts)
-                    # Fetch positions again immediately
-                    response = await self._run_api_call(self.client.get_positions, api_keys)
-
-                # Store response for resizing and dynamic rendering
-                self.last_positions_response = response
-                self._positions_version = getattr(self, "_positions_version", 0) + 1
-
-                # Store active positions for auto-resolution
-                self.active_positions = []
-                self.position_id_map = {}
-                pos_idx = 1
-                for acct in response.get("accounts", []):
-                    # Filter only non-zero quantity open positions
-                    for pos in acct.get("positions", []):
-                        if pos.get("quantity", 0) != 0:
-                            pos["api_key"] = acct.get("api_key")
-                            pos["account_name"] = acct.get("name")
-                            self.active_positions.append(pos)
-                            self.position_id_map[pos_idx] = pos
-                            pos_idx += 1
-
-                self._update_positions_display()
-
-                # Fetch market indices
+        # Connect WebSockets for all accounts
+        from kiteconnect import KiteTicker
+        for acct in self.accounts:
+            api_key = acct.get("api_key")
+            access_token = self.client.get_access_token(api_key)
+            if api_key and access_token:
                 try:
-                    indices_resp = await self._run_api_call(self.client.get_market_indices)
-                    if indices_resp.get("status") == "success":
-                        nifty = indices_resp.get("nifty")
-                        sensex = indices_resp.get("sensex")
-                        vix = indices_resp.get("vix")
-
-                        nifty_str = f"{nifty:,.2f}" if nifty else "N/A"
-                        sensex_str = f"{sensex:,.2f}" if sensex else "N/A"
-                        vix_str = f"{vix:,.2f}" if vix else "N/A"
-
-                        self.market_indices_control.text = HTML(
-                            f"  <ansicyan><b>NIFTY 50:</b></ansicyan> <style fg='#ffffff'>{nifty_str}</style>   "
-                            f"│   <ansiyellow><b>SENSEX:</b></ansiyellow> <style fg='#ffffff'>{sensex_str}</style>   "
-                            f"│   <ansired><b>INDIA VIX:</b></ansired> <style fg='#ffffff'>{vix_str}</style>"
-                        )
-                    else:
-                        msg = indices_resp.get("message", "Unknown error")
-                        self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices: {msg}</style>")
+                    ticker = KiteTicker(api_key, access_token)
+                    
+                    ticker.on_connect = self._make_on_connect(api_key, ticker)
+                    ticker.on_ticks = self._on_ticks
+                    ticker.on_order_update = self._make_on_order_update(api_key)
+                    ticker.on_close = self._make_on_close(api_key)
+                    
+                    # Run ticker loop in a background thread
+                    ticker.connect(threaded=True)
+                    self.tickers[api_key] = ticker
                 except Exception as exc:
-                    self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices Error: {exc}</style>")
+                    self.log_message(f"[#ff0000]Failed to connect WebSocket for {acct.get('name')}:[/#] {exc}")
 
-                self.app.invalidate()
-            except KCLIClientError as exc:
-                self.log_message(f"[#ff0000]API Error:[/#] {exc}")
-            except Exception as exc:
-                self.log_message(f"[#ff0000]Unexpected error:[/#] {exc}")
+    def _get_account_name(self, api_key: str) -> str:
+        """Helper to get account name by api_key."""
+        for acct in self.accounts:
+            if acct.get("api_key") == api_key:
+                return acct.get("name", api_key)
+        return api_key
 
-            # Sleep in small increments to check running flag and exit quickly if needed
-            for _ in range(int(self.refresh_interval * 10)):
-                if not self.running:
-                    break
-                await asyncio.sleep(0.1)
+    def _make_on_connect(self, api_key: str, ticker):
+        def on_connect(ws, response):
+            name = self._get_account_name(api_key)
+            self.log_message(f"[#00ff00]WebSocket connected:[/#] @{name}")
+            # Subscribe to position tokens
+            if self.subscribed_tokens:
+                ticker.subscribe(list(self.subscribed_tokens))
+                ticker.set_mode(ticker.MODE_LTP, list(self.subscribed_tokens))
+        return on_connect
+
+    def _make_on_close(self, api_key: str):
+        def on_close(ws, code, reason):
+            name = self._get_account_name(api_key)
+            self.log_message(f"[#ff8700]WebSocket closed:[/#] @{name} ({reason})")
+        return on_close
+
+    def _make_on_order_update(self, api_key: str):
+        def on_order_update(ws, data):
+            status = data.get("status")
+            symbol = data.get("tradingsymbol")
+            qty = data.get("quantity")
+            ord_type = data.get("transaction_type")
+            name = self._get_account_name(api_key)
+            self.log_message(f"[#00afaf]Order update [@{name}]:[/#] {ord_type} {qty} {symbol} -> {status}")
+            
+            # Trigger immediate refresh of positions and orders
+            if hasattr(self, "app") and self.app and self.app.loop:
+                asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+        return on_order_update
+
+    def _on_ticks(self, ws, ticks):
+        updated = False
+        for tick in ticks:
+            token = tick.get("instrument_token")
+            ltp = tick.get("last_price")
+            if token and ltp:
+                resp = getattr(self, "last_positions_response", None)
+                if resp:
+                    for acct in resp.get("accounts", []):
+                        for pos in acct.get("positions", []):
+                            if pos.get("instrument_token") == token:
+                                pos["last_price"] = ltp
+                                # Recalculate P&L
+                                avg_price = pos.get("average_price", 0.0)
+                                qty = pos.get("quantity", 0)
+                                pos["pnl"] = (ltp - avg_price) * qty
+                                if avg_price > 0:
+                                    pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
+                                else:
+                                    pos["pnl_pct"] = 0.0
+                                updated = True
+                        
+                        # Recalculate total P&L for account
+                        acct["total_pnl"] = sum(p.get("pnl", 0.0) for p in acct.get("positions", []))
+        
+        if updated:
+            self._positions_version = getattr(self, "_positions_version", 0) + 1
+            if hasattr(self, "app") and self.app and self.app.loop:
+                self.app.loop.call_soon_threadsafe(self._update_display_and_invalidate)
+
+    def _update_display_and_invalidate(self) -> None:
+        """Helper to re-render positions and invalidate TUI."""
+        self._update_positions_display()
+        if hasattr(self, "app") and self.app:
+            self.app.invalidate()
+
+    def _update_subscriptions(self, new_tokens: set[int]) -> None:
+        """Subscribe to new tokens and unsubscribe from inactive ones."""
+        to_subscribe = new_tokens - self.subscribed_tokens
+        to_unsubscribe = self.subscribed_tokens - new_tokens
+        
+        if to_subscribe:
+            for ticker in self.tickers.values():
+                try:
+                    ticker.subscribe(list(to_subscribe))
+                    ticker.set_mode(ticker.MODE_LTP, list(to_subscribe))
+                except Exception:
+                    pass
+            self.subscribed_tokens.update(to_subscribe)
+            
+        if to_unsubscribe:
+            for ticker in self.tickers.values():
+                try:
+                    ticker.unsubscribe(list(to_unsubscribe))
+                except Exception:
+                    pass
+            self.subscribed_tokens.difference_update(to_unsubscribe)
+
+    async def _trigger_immediate_refresh(self) -> None:
+        """Trigger an immediate fetch of positions, orders, and indices from Zerodha."""
+        # 1. Fetch positions
+        api_keys = [acct["api_key"] for acct in self.accounts]
+        response = await self._run_api_call(self.client.get_positions, api_keys)
+        self.last_positions_response = response
+        self._positions_version = getattr(self, "_positions_version", 0) + 1
+        
+        # Update active positions list and collect tokens
+        self.active_positions = []
+        self.position_id_map = {}
+        pos_idx = 1
+        new_tokens = set()
+        for acct in response.get("accounts", []):
+            for pos in acct.get("positions", []):
+                if pos.get("quantity", 0) != 0:
+                    pos["api_key"] = acct.get("api_key")
+                    pos["account_name"] = acct.get("name")
+                    self.active_positions.append(pos)
+                    self.position_id_map[pos_idx] = pos
+                    pos_idx += 1
+                    if pos.get("instrument_token"):
+                        new_tokens.add(int(pos["instrument_token"]))
+        
+        # Update WebSocket subscriptions
+        self._update_subscriptions(new_tokens)
+        
+        # 2. Fetch orders
+        orders_resp = await self._run_api_call(self.client.get_orders, api_keys)
+        self._last_pending_text = self._render_orders_pane(orders_resp, "orders_pending")
+        self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
+        if self.info_mode in ("orders_pending", "orders_executed"):
+            self._update_info_buffer()
+            
+        # 3. Fetch indices
+        try:
+            indices_resp = await self._run_api_call(self.client.get_market_indices)
+            if indices_resp.get("status") == "success":
+                nifty = indices_resp.get("nifty")
+                sensex = indices_resp.get("sensex")
+                vix = indices_resp.get("vix")
+
+                nifty_str = f"{nifty:,.2f}" if nifty else "N/A"
+                sensex_str = f"{sensex:,.2f}" if sensex else "N/A"
+                vix_str = f"{vix:,.2f}" if vix else "N/A"
+
+                self.market_indices_control.text = HTML(
+                    f"  <ansicyan><b>NIFTY 50:</b></ansicyan> <style fg='#ffffff'>{nifty_str}</style>   "
+                    f"│   <ansiyellow><b>SENSEX:</b></ansiyellow> <style fg='#ffffff'>{sensex_str}</style>   "
+                    f"│   <ansired><b>INDIA VIX:</b></ansired> <style fg='#ffffff'>{vix_str}</style>"
+                )
+            else:
+                msg = indices_resp.get("message", "Unknown error")
+                self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices: {msg}</style>")
+        except Exception as exc:
+            self.market_indices_control.text = HTML(f"  <style fg='#ff5f5f'>Indices Error: {exc}</style>")
 
     def resolve_symbol(self, input_sym: str) -> tuple[str | None, str | None, str | None]:
         """Resolve a symbol against current active positions.
@@ -818,11 +924,11 @@ class KCLILiveSession:
             self.log_message("  [bold]deselect[/bold] - Clear current active selection")
             self.log_message("  [bold]exit [symbol|id][/bold] - Exit position (current selection if symbol omitted)")
             self.log_message("  [bold]exit all[/bold] - Exit ALL open positions across all/selected accounts")
-            self.log_message("  [bold]refresh <seconds>[/bold] - Change auto-refresh interval")
+            self.log_message("  [bold]refresh[/bold] - Trigger manual sync of positions/orders")
             self.log_message("  [bold]clear[/bold] - Clear logs screen")
             self.log_message("  [bold]quit / exit[/bold] - Close dashboard")
             self.log_message("[#00afaf]Right Pane (Info Panel):[/#]")
-            self.log_message("  [bold]F1[/bold] — Pending Orders (per account, auto-refresh every 10s)")
+            self.log_message("  [bold]F1[/bold] — Pending Orders (per account, real-time)")
             self.log_message("  [bold]F2[/bold] — Executed Orders (per account, today)")
             self.log_message("  [bold]F3[/bold] — Option Chain (after running 'oc' command)")
             self.log_message("[#00afaf]Navigation:[/#]")
@@ -834,17 +940,9 @@ class KCLILiveSession:
             return
 
         if primary_cmd == "refresh":
-            if len(parts) != 2:
-                self.log_message("[#ff0000]Usage:[/#] refresh <seconds>")
-                return
-            try:
-                seconds = int(parts[1])
-                if seconds < 1:
-                    raise ValueError()
-                self.refresh_interval = seconds
-                self.log_message(f"Refresh interval set to {seconds} seconds.")
-            except ValueError:
-                self.log_message("[#ff0000]Error:[/#] Refresh interval must be a positive integer.")
+            self.log_message("Triggering manual refresh...")
+            if hasattr(self, "app") and self.app and self.app.loop:
+                asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
             return
 
         # Deselect Command
@@ -1383,24 +1481,6 @@ class KCLILiveSession:
         if hasattr(self, "app"):
             self.app.invalidate()
 
-    async def _update_orders_loop(self) -> None:
-        """Periodically fetch orders from the server (every 10 seconds)."""
-        while self.running:
-            try:
-                api_keys = [acct["api_key"] for acct in self.accounts]
-                response = await self._run_api_call(self.client.get_orders, api_keys)
-                self._last_pending_text = self._render_orders_pane(response, "orders_pending")
-                self._last_executed_text = self._render_orders_pane(response, "orders_executed")
-                if self.info_mode in ("orders_pending", "orders_executed"):
-                    self._update_info_buffer()
-            except Exception as exc:
-                self.log_message(f"[#ff0000]Orders fetch error:[/#] {exc}")
-
-            for _ in range(100):  # 10-second intervals
-                if not self.running:
-                    break
-                await asyncio.sleep(0.1)
-
     def _get_frame_style(self, body_window) -> str:
         """Return focused_frame style if the window or its content has focus."""
         if hasattr(self, "app") and self.app:
@@ -1838,7 +1918,7 @@ class KCLILiveSession:
                 # ── LEFT half: Positions (scrollable) + Logs (scrollable) ──
                 HSplit([
                     Frame(
-                        title="Active Positions (Auto-refreshing) [Tab: focus]",
+                        title="Active Positions (Live Ticks) [Tab: focus]",
                         body=self.positions_window,
                         style=self._get_frame_style(self.positions_window),
                     ),
@@ -1899,10 +1979,14 @@ class KCLILiveSession:
             mouse_support=True,
         )
 
-        asyncio.create_task(self._update_loop())
-        asyncio.create_task(self._update_orders_loop())
+        asyncio.create_task(self._initial_fetch_and_connect())
 
         try:
             await self.app.run_async()
         finally:
             self.running = False
+            for api_key, ticker in list(self.tickers.items()):
+                try:
+                    ticker.close()
+                except Exception as exc:
+                    logger.warning("Failed to close ticker for %s: %s", api_key[:8], exc)
