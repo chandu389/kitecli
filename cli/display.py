@@ -24,8 +24,8 @@ BANNER = r"""
 
 
 def display_banner() -> None:
-    """Print the KiteCLI banner in bold cyan."""
-    console.print(Text(BANNER, style="bold cyan"))
+    """Print the KiteCLI banner in bold blue/cyan."""
+    console.print(Text(BANNER, style="bold #58a6ff"))
 
 
 # ── Positions ──────────────────────────────────────────────────────
@@ -56,12 +56,12 @@ def _format_currency(value: float) -> str:
 
 
 def _pnl_style(value: float) -> str:
-    """Return 'green' for positive, 'red' for negative, dim otherwise."""
+    """Return soft green/red/dim colors for positive/negative P&L."""
     if value > 0:
-        return "green"
+        return "#3fb950"
     elif value < 0:
-        return "red"
-    return "dim"
+        return "#f85149"
+    return "#8b949e"
 
 
 def _format_pnl_pct(value: float) -> str:
@@ -87,15 +87,15 @@ def display_positions(accounts_data: list[dict]) -> None:
 
         pnl_color = _pnl_style(total_pnl)
         header_text = Text.assemble(
-            (f" {name} ", "bold white"),
-            (" │ ", "dim"),
+            (f" {name} ", "bold #e6edf3"),
+            (" │ ", "#8b949e"),
             ("P&L: ", "bold"),
             (f"{_format_currency(total_pnl)}", f"bold {pnl_color}"),
         )
 
         if not positions:
             panel = Panel(
-                Text("  No open positions", style="dim italic"),
+                Text("  No open positions", style="#8b949e italic"),
                 title=header_text,
                 border_style=pnl_color,
                 padding=(1, 2),
@@ -106,13 +106,13 @@ def display_positions(accounts_data: list[dict]) -> None:
 
         table = Table(
             show_header=True,
-            header_style="bold cyan",
-            border_style="dim",
+            header_style="bold #58a6ff",
+            border_style="#30363d",
             row_styles=["", "dim"],
             pad_edge=True,
             expand=True,
         )
-        table.add_column("Symbol", style="bold white", no_wrap=True)
+        table.add_column("Symbol", style="bold #e6edf3", no_wrap=True)
         table.add_column("Qty", justify="right")
         table.add_column("Avg Price", justify="right")
         table.add_column("LTP", justify="right")
@@ -184,15 +184,15 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
 
         pnl_color = _pnl_style(total_pnl)
         header_text = Text.assemble(
-            (f" {name} ", "bold white"),
-            (" │ ", "dim"),
+            (f" {name} ", "bold #e6edf3"),
+            (" │ ", "#8b949e"),
             ("P&L: ", "bold"),
             (f"{_format_currency(total_pnl)}", f"bold {pnl_color}"),
         )
 
         if not positions:
             panel = Panel(
-                Text("  No open positions", style="dim italic"),
+                Text("  No open positions", style="#8b949e italic"),
                 title=header_text,
                 border_style=pnl_color,
                 padding=(1, 2),
@@ -203,13 +203,13 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
 
         table = Table(
             show_header=True,
-            header_style="bold cyan",
-            border_style="dim",
+            header_style="bold #58a6ff",
+            border_style="#30363d",
             row_styles=["", "dim"],
             pad_edge=True,
             expand=True,
         )
-        table.add_column("Symbol", style="bold white", no_wrap=True)
+        table.add_column("Symbol", style="bold #e6edf3", no_wrap=True)
         table.add_column("Qty", justify="right")
         table.add_column("Avg Price", justify="right")
         table.add_column("LTP", justify="right")
@@ -272,22 +272,22 @@ def display_login_urls(accounts: list[dict]) -> None:
     """
     lines = Text()
     for acct in accounts:
-        lines.append("  ✓ ", style="bold green")
-        lines.append(f"{acct.get('name', 'Account')}", style="bold white")
+        lines.append("  ✓ ", style="bold #3fb950")
+        lines.append(f"{acct.get('name', 'Account')}", style="bold #e6edf3")
         lines.append("\n    ", style="")
-        lines.append(f"{acct.get('login_url', 'N/A')}", style="underline cyan")
+        lines.append(f"{acct.get('login_url', 'N/A')}", style="underline #58a6ff")
         lines.append("\n\n")
 
     lines.append(
         "  Open each URL in your browser to authorize the account.\n",
-        style="dim italic",
+        style="#8b949e italic",
     )
 
     console.print(
         Panel(
             lines,
-            title="[bold cyan]🔗 Login URLs[/bold cyan]",
-            border_style="cyan",
+            title="[bold #58a6ff]🔗 Login URLs[/bold #58a6ff]",
+            border_style="#58a6ff",
             padding=(1, 2),
         )
     )
@@ -303,27 +303,27 @@ def display_status(accounts: list[dict]) -> None:
     """
     table = Table(
         show_header=True,
-        header_style="bold cyan",
-        border_style="dim",
+        header_style="bold #58a6ff",
+        border_style="#30363d",
         pad_edge=True,
     )
-    table.add_column("Account", style="bold white")
+    table.add_column("Account", style="bold #e6edf3")
     table.add_column("Status", justify="center")
 
     for acct in accounts:
         name = acct.get("name", "Unknown")
         authed = acct.get("authenticated", False)
         if authed:
-            status = Text("✓ Authenticated", style="bold green")
+            status = Text("✓ Authenticated", style="bold #3fb950")
         else:
-            status = Text("✗ Not Authenticated", style="bold red")
+            status = Text("✗ Not Authenticated", style="bold #f85149")
         table.add_row(name, status)
 
     console.print(
         Panel(
             table,
-            title="[bold cyan]📊 Account Status[/bold cyan]",
-            border_style="cyan",
+            title="[bold #58a6ff]📊 Account Status[/bold #58a6ff]",
+            border_style="#58a6ff",
             padding=(1, 1),
         )
     )
@@ -335,9 +335,9 @@ def display_error(message: str) -> None:
     """Print a styled error message."""
     console.print(
         Panel(
-            Text(f"  {message}", style="bold red"),
-            title="[bold red]✗ Error[/bold red]",
-            border_style="red",
+            Text(f"  {message}", style="bold #f85149"),
+            title="[bold #f85149]✗ Error[/bold #f85149]",
+            border_style="#f85149",
             padding=(0, 1),
         )
     )
@@ -347,9 +347,9 @@ def display_success(message: str) -> None:
     """Print a styled success message."""
     console.print(
         Panel(
-            Text(f"  {message}", style="bold green"),
-            title="[bold green]✓ Success[/bold green]",
-            border_style="green",
+            Text(f"  {message}", style="bold #3fb950"),
+            title="[bold #3fb950]✓ Success[/bold #3fb950]",
+            border_style="#3fb950",
             padding=(0, 1),
         )
     )
@@ -359,9 +359,9 @@ def display_info(message: str) -> None:
     """Print a styled informational message."""
     console.print(
         Panel(
-            Text(f"  {message}", style="bold cyan"),
-            title="[bold cyan]ℹ Info[/bold cyan]",
-            border_style="cyan",
+            Text(f"  {message}", style="bold #58a6ff"),
+            title="[bold #58a6ff]ℹ Info[/bold #58a6ff]",
+            border_style="#58a6ff",
             padding=(0, 1),
         )
     )

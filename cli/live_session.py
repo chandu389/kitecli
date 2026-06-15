@@ -120,25 +120,32 @@ class KCLILiveSession:
         self.dragging_vertical = False
         self.dragging_horizontal = False
         
-        # Style definition for UI elements
+        # Style definition for UI elements (professional dark theme)
         self.style = Style.from_dict({
-            "header": "bg:#005f87 #ffffff bold",
-            "prompt_label": "fg:#00afaf bold",
+            "header": "bg:#21262d fg:#e6edf3 bold",
+            "prompt_label": "fg:#58a6ff bold",
             "input_text": "fg:#ffffff",
-            "log_title": "fg:#ff8700 bold",
-            "selected_row": "bg:ansiblue fg:ansiwhite bold",
-            "info_header": "fg:#87ff87 bold",
-            "divider": "bg:#2b2b2b fg:#5a5a5a",
-            "divider.dragging": "bg:#0087af fg:#ffffff bold",
-            "market_indices": "bg:#121212",
+            "log_title": "fg:#d29922 bold",
+            "selected_row": "bg:#1f6feb fg:#ffffff bold",
+            "info_header": "fg:#56d364 bold",
+            "divider": "bg:#21262d fg:#30363d",
+            "divider.dragging": "bg:#0969da fg:#ffffff bold",
+            "market_indices": "bg:#161b22",
             # Quick action bar
-            "quickaction": "bg:#1c1c1c fg:#888888",
-            "quickaction.hint": "bg:#1c1c1c fg:#555555 italic",
-            "btn.buy": "bg:#005f00 fg:#afffaf bold",
-            "btn.sell": "bg:#5f0000 fg:#ffafaf bold",
-            "btn.exit": "bg:#5f005f fg:#ffafff bold",
-            "btn.modify": "bg:#00005f fg:#afafff bold",
-            "btn.cancel": "bg:#3a3a3a fg:#d0d0d0 bold",
+            "quickaction": "bg:#161b22 fg:#8b949e",
+            "quickaction.hint": "bg:#161b22 fg:#484f58 italic",
+            # Buttons (Soft professional colors)
+            "btn.buy": "bg:#1b4a2d fg:#56d364 bold",
+            "btn.sell": "bg:#5e1c18 fg:#ff7b72 bold",
+            "btn.exit": "bg:#4a1b4d fg:#e85ffd bold",
+            "btn.modify": "bg:#18315e fg:#79c0ff bold",
+            "btn.cancel": "bg:#30363d fg:#8b949e bold",
+            
+            # Frame and Borders (Focused Container Highlight)
+            "frame.border": "fg:#30363d",
+            "frame.label": "fg:#8b949e bold",
+            "focused_frame.border": "fg:#58a6ff bold",
+            "focused_frame.label": "fg:#58a6ff bold",
         })
 
     def _strip_rich_markup(self, text: str) -> str:
@@ -1394,6 +1401,15 @@ class KCLILiveSession:
                     break
                 await asyncio.sleep(0.1)
 
+    def _get_frame_style(self, body_window) -> str:
+        """Return focused_frame style if the window or its content has focus."""
+        if hasattr(self, "app") and self.app:
+            if self.app.layout.has_focus(body_window):
+                return "class:focused_frame"
+            if hasattr(body_window, "content") and self.app.layout.has_focus(body_window.content):
+                return "class:focused_frame"
+        return "class:frame"
+
     def handle_global_drag(self, mouse_event, x, y) -> None:
         """Handle global mouse drag events to resize panes."""
         from prompt_toolkit.mouse_events import MouseEventType
@@ -1824,11 +1840,13 @@ class KCLILiveSession:
                     Frame(
                         title="Active Positions (Auto-refreshing) [Tab: focus]",
                         body=self.positions_window,
+                        style=self._get_frame_style(self.positions_window),
                     ),
                     self.horizontal_divider,
                     Frame(
                         title="Status Logs [Tab: focus] [Ctrl+↑↓: resize]",
                         body=self.logs_window,
+                        style=self._get_frame_style(self.logs_window),
                     ),
                 ], width=D(weight=lw)),
                 self.vertical_divider,
@@ -1844,6 +1862,7 @@ class KCLILiveSession:
                         Window(height=1, char="─", style="class:divider"),
                         self.info_window,
                     ]),
+                    style=self._get_frame_style(self.info_window),
                     width=D(weight=rw),
                 ),
             ])
