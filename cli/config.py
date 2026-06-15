@@ -39,7 +39,14 @@ def load_config() -> Optional[dict]:
         return None
 
     with open(CONFIG_FILE, "r") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f)
+
+    # Automatically migrate/remove legacy server config if present
+    if config and "server" in config:
+        del config["server"]
+        save_config(config)
+
+    return config
 
 
 def save_config(config: dict) -> None:

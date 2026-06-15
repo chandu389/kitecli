@@ -320,7 +320,7 @@ class KCLILiveSession:
     def _update_positions_display(self) -> None:
         """Render positions to a formatted string aligned to the left container width."""
         if not getattr(self, "last_positions_response", None):
-            self.positions_control.text = "Fetching positions from server, please wait..."
+            self.positions_control.text = "Fetching positions, please wait..."
             return
 
         # Calculate width of the positions container dynamically
@@ -440,7 +440,7 @@ class KCLILiveSession:
                         break
 
                 if has_unregistered:
-                    self.log_message("[#ffaa00]Server lost account session. Re-initializing...[/#]")
+                    self.log_message("[#ffaa00]Account session expired. Re-initializing...[/#]")
                     await self._run_api_call(self.client.init_accounts, self.accounts)
                     # Fetch positions again immediately
                     response = await self._run_api_call(self.client.get_positions, api_keys)
@@ -1442,7 +1442,7 @@ class KCLILiveSession:
         # the Window can receive keyboard scroll (Page Up/Down, arrow keys)
         # and mouse-wheel scroll when focused.
         self.positions_control = ScrollableFormattedTextControl(
-            text="Fetching positions from server, please wait...",
+            text="Fetching positions, please wait...",
             focusable=True,
             show_cursor=False,
         )

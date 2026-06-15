@@ -95,9 +95,9 @@ def init() -> None:
         display_error("No accounts configured. Edit your config file to add accounts.")
         raise typer.Exit(code=1)
 
-    # Init accounts on server (auto-login is attempted server-side)
+    # Init accounts (auto-login is attempted)
     try:
-        display_info("Initialising accounts on server…")
+        display_info("Initialising accounts…")
         result = client.init_accounts(accounts)
         console.print()
     except KCLIClientError as exc:
@@ -174,7 +174,7 @@ def positions() -> None:
 
     accounts_data = result.get("accounts", [])
     if not accounts_data:
-        display_info("No position data returned from server.")
+        display_info("No position data returned.")
         raise typer.Exit()
 
     display_positions(accounts_data)
@@ -191,7 +191,7 @@ def status() -> None:
 
     status_accounts = result.get("accounts", [])
     if not status_accounts:
-        display_info("No account status returned from server.")
+        display_info("No account status returned.")
         raise typer.Exit()
 
     display_status(status_accounts)
