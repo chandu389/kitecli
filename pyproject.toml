@@ -3,8 +3,8 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kcli"
-version = "0.1.0"
+name = "kitecli"
+version = "0.1.0b1"
 description = "Kite Connect CLI — Multi-account Zerodha trading positions viewer"
 readme = "README.md"
 requires-python = ">=3.10"
