@@ -369,7 +369,21 @@ class KCLILiveSession:
         """Add a timestamped message to the logs and update logs pane."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         plain = self._strip_rich_markup(message)
-        self.logs.append(f"[{timestamp}] {plain}")
+
+        # Compute max usable width for the logs pane so long lines don't wrap
+        # and spill outside the Frame. Frame border = 2, padding = 2, safety = 2.
+        try:
+            total_cols = self.app.output.get_size().columns if (hasattr(self, "app") and self.app and self.app.output) else 80
+            left_width = int(total_cols * (self.left_width_pct / 100.0))
+            max_line = max(40, left_width - 8)
+        except Exception:
+            max_line = 120
+
+        line = f"[{timestamp}] {plain}"
+        if len(line) > max_line:
+            line = line[:max_line - 1] + "…"
+
+        self.logs.append(line)
         if len(self.logs) > 500:
             self.logs.pop(0)
 
@@ -1682,18 +1696,30 @@ class KCLILiveSession:
             else:
                 # Case 2: Parse symbol and quantity.
                 # Scan right-to-left for a qty token to avoid strike prices/dates.
+                # IMPORTANT: NL tokens (e.g. '2L') take priority over plain integers
+                # to their right (which are likely prices). So first try to find an NL
+                # token; only fall back to plain-integer scan if none found.
                 qty_idx = -1
+
+                # Pass 1: look for rightmost NL token (e.g. '2L', '1L')
                 for i in range(len(args) - 1, -1, -1):
                     arg = args[i]
-                    if _is_qty_token(arg):
-                        # A plain strike price (e.g. 23500) is followed by CE/PE/FUT — skip
+                    if arg.upper().endswith("L") and arg[:-1].isdigit():
+                        qty_idx = i
+                        break
+
+                # Pass 2: if no NL token, fall back to rightmost plain integer
+                if qty_idx == -1:
+                    for i in range(len(args) - 1, -1, -1):
+                        arg = args[i]
                         if arg.isdigit():
+                            # Skip strike prices: followed by CE/PE/FUT or >= 1000
                             if i + 1 < len(args) and args[i+1].upper() in ("CE", "PE", "FUT"):
                                 continue
                             if int(arg) >= 1000:
                                 continue
-                        qty_idx = i
-                        break
+                            qty_idx = i
+                            break
 
                 if qty_idx != -1:
                     qty_str = args[qty_idx]
