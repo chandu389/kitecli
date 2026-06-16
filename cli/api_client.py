@@ -317,6 +317,10 @@ class KCLIClient:
 
         return {"accounts": results}
 
+    def get_nfo_lot_sizes(self) -> dict:
+        """Fetch NFO tradingsymbol → lot_size map (one-shot, cache at startup)."""
+        return _manager.get_nfo_lot_sizes()
+
     def get_market_indices(self) -> dict:
         """Fetch live Nifty, Sensex, and India VIX."""
         return _manager.get_market_indices()

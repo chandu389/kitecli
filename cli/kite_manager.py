@@ -832,7 +832,33 @@ class KiteAccountManager:
             logger.warning("get_margins failed for api_key=%s…: %s", api_key[:8], exc)
             return {"net": None, "cash": None}
 
-    def get_market_indices(self) -> dict[str, Any]:
+    def get_nfo_lot_sizes(self) -> dict[str, int]:
+        """Fetch NFO instrument list and return a tradingsymbol → lot_size map.
+
+        Uses the first authenticated account. The result is a flat dict keyed
+        by *tradingsymbol* (e.g. ``"NIFTY2561924000CE"`` → ``75``) so position
+        lot lookup is an O(1) dict access with no symbol parsing required.
+
+        Returns an empty dict if no authenticated account is available or the
+        call fails.
+        """
+        for api_key in self.get_all_api_keys():
+            if self.is_authenticated(api_key):
+                kite = self._clients.get(api_key)
+                if kite:
+                    try:
+                        instruments = kite.instruments("NFO")
+                        return {
+                            inst["tradingsymbol"]: int(inst.get("lot_size", 1) or 1)
+                            for inst in instruments
+                            if inst.get("tradingsymbol")
+                        }
+                    except Exception as exc:
+                        logger.warning("get_nfo_lot_sizes failed: %s", exc)
+                        return {}
+        return {}
+
+
         """Fetch Nifty, Sensex, and India VIX LTP using first authenticated account, or fallback to Yahoo Finance."""
         # 1. Try Kite first
         for api_key in self.get_all_api_keys():

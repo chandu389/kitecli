@@ -229,7 +229,7 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
             expand=True,
         )
         table.add_column("Symbol", style="bold #e6edf3", no_wrap=True)
-        table.add_column("Qty", justify="right")
+        table.add_column("Lots/Qty", justify="right")
         table.add_column("Avg Price", justify="right")
         table.add_column("LTP", justify="right")
         table.add_column("P&L", justify="right")
@@ -245,9 +245,18 @@ def render_positions_to_string(accounts_data: list[dict], width: int = 80, show_
                 symbol = f"[{pos_idx}] {symbol}"
                 pos_idx += 1
 
+            lot_size = pos.get("lot_size", 1) or 1
+            qty = pos.get("quantity", 0)
+            if lot_size > 1:
+                lots = qty / lot_size
+                # Show as integer lots if whole number, else 1 decimal
+                qty_display = f"{int(lots)}L" if lots == int(lots) else f"{lots:.1f}L"
+            else:
+                qty_display = str(qty)
+
             table.add_row(
                 symbol,
-                str(pos.get("quantity", 0)),
+                qty_display,
                 _format_currency(float(pos.get("average_price", 0))),
                 _format_currency(float(pos.get("last_price", 0))),
                 Text(_format_currency(pnl), style=style),
