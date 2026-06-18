@@ -28,12 +28,11 @@ logger = logging.getLogger(__name__)
 
 
 def _silence_websocket_loggers() -> None:
-    """Route noisy third-party WebSocket loggers to a file instead of the
+    """Route noisy third-party and CLI loggers to a file instead of the
     terminal.
 
-    kiteconnect/autobahn/twisted emit ``log.error(...)`` calls (e.g. the
-    repeated "Connection closed: 1006" / "Connection error: 1006" lines) on a
-    module-level logger. The root logger has no handlers, so Python's
+    kiteconnect/autobahn/twisted/urllib3 and our own CLI module emit log warnings/errors
+    on their module-level loggers. The root logger has no handlers, so Python's
     "last resort" handler writes them to stderr — which corrupts this
     full-screen prompt_toolkit TUI. We attach a dedicated file handler to those
     loggers and disable propagation so nothing reaches the terminal.
@@ -49,13 +48,16 @@ def _silence_websocket_loggers() -> None:
         logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
     )
 
-    for name in ("kiteconnect", "kiteconnect.ticker", "autobahn", "twisted"):
+    for name in ("kiteconnect", "kiteconnect.ticker", "autobahn", "twisted", "cli", "urllib3"):
         noisy = logging.getLogger(name)
         # Avoid stacking duplicate handlers if run() is called more than once.
         if not any(isinstance(h, logging.FileHandler) for h in noisy.handlers):
             noisy.addHandler(file_handler)
         noisy.propagate = False
-        noisy.setLevel(logging.WARNING)
+        if name == "cli":
+            noisy.setLevel(logging.INFO)
+        else:
+            noisy.setLevel(logging.WARNING)
 
 
 def probe_ws_auth(api_key: str, access_token: str, proxy_str: str = None,
@@ -1431,10 +1433,15 @@ class KCLILiveSession:
 
         except KCLIClientError as exc:
             self.log_message(f"[#ff0000]Exit Execution Failed:[/#] {exc}")
-        except Exception as exc:
-            self.log_message(f"[#ff0000]Unexpected Error:[/#] {exc}")
-
     def handle_input(self, buffer) -> None:
+        """Process entered command line with error safety wrapper."""
+        try:
+            return self._handle_input_core(buffer)
+        except Exception as exc:
+            self.log_message(f"[#ff0000]Error processing input:[/#] {exc}")
+            logger.error("Error processing input: %s", exc, exc_info=True)
+
+    def _handle_input_core(self, buffer) -> None:
         """Process entered command line."""
         cmd = buffer.text.strip()
         if not cmd:
