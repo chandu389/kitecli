@@ -169,6 +169,7 @@ class KiteAccountManager:
                             "pnl": pos.get("pnl", 0.0),
                             "product": pos.get("product", ""),
                             "exchange": pos.get("exchange", ""),
+                            "instrument_token": pos.get("instrument_token"),
                         }
                     )
 
