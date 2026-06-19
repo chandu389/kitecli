@@ -607,6 +607,72 @@ class KiteAccountManager:
 
         return orders_placed
 
+    def modify_order(
+        self,
+        api_key: str,
+        order_id: str,
+        quantity: int | None = None,
+        price: float | None = None,
+        order_type: str | None = None,
+        trigger_price: float | None = None,
+    ) -> str:
+        """Modify an open order.
+
+        Returns:
+            The order ID.
+        """
+        kite = self._clients.get(api_key)
+        if not kite:
+            raise ValueError(f"Account not found for api_key={api_key[:8]}…")
+
+        if not self.is_authenticated(api_key):
+            raise RuntimeError(f"Account '{self._account_names.get(api_key, api_key)}' is not authenticated.")
+
+        params = {
+            "variety": kite.VARIETY_REGULAR,
+            "order_id": order_id,
+        }
+        if quantity is not None:
+            params["quantity"] = quantity
+        if price is not None:
+            params["price"] = price
+        if order_type is not None:
+            params["order_type"] = order_type.upper()
+        if trigger_price is not None:
+            params["trigger_price"] = trigger_price
+
+        try:
+            return kite.modify_order(**params)
+        except Exception as exc:
+            logger.error("Failed to modify order %s for api_key=%s…", order_id, api_key[:8])
+            raise RuntimeError(f"Failed to modify order: {exc}") from exc
+
+    def cancel_order(
+        self,
+        api_key: str,
+        order_id: str,
+    ) -> str:
+        """Cancel an open order.
+
+        Returns:
+            The order ID.
+        """
+        kite = self._clients.get(api_key)
+        if not kite:
+            raise ValueError(f"Account not found for api_key={api_key[:8]}…")
+
+        if not self.is_authenticated(api_key):
+            raise RuntimeError(f"Account '{self._account_names.get(api_key, api_key)}' is not authenticated.")
+
+        try:
+            return kite.cancel_order(
+                variety=kite.VARIETY_REGULAR,
+                order_id=order_id,
+            )
+        except Exception as exc:
+            logger.error("Failed to cancel order %s for api_key=%s…", order_id, api_key[:8])
+            raise RuntimeError(f"Failed to cancel order: {exc}") from exc
+
     def get_option_chain(
         self,
         api_key: str,

@@ -317,6 +317,44 @@ class KCLIClient:
 
         return {"accounts": results}
 
+    def modify_order(
+        self,
+        api_key: str,
+        order_id: str,
+        quantity: int | None = None,
+        price: float | None = None,
+        order_type: str | None = None,
+        trigger_price: float | None = None,
+    ) -> dict:
+        """Modify an order on a specific account."""
+        try:
+            res_id = _manager.modify_order(
+                api_key=api_key,
+                order_id=order_id,
+                quantity=quantity,
+                price=price,
+                order_type=order_type,
+                trigger_price=trigger_price,
+            )
+            return {"status": "success", "order_id": res_id, "message": f"Order modified: {res_id}"}
+        except Exception as exc:
+            return {"status": "error", "order_id": None, "message": str(exc)}
+
+    def cancel_order(
+        self,
+        api_key: str,
+        order_id: str,
+    ) -> dict:
+        """Cancel an order on a specific account."""
+        try:
+            res_id = _manager.cancel_order(
+                api_key=api_key,
+                order_id=order_id,
+            )
+            return {"status": "success", "order_id": res_id, "message": f"Order cancelled: {res_id}"}
+        except Exception as exc:
+            return {"status": "error", "order_id": None, "message": str(exc)}
+
     def get_nfo_lot_sizes(self) -> dict:
         """Fetch NFO tradingsymbol → lot_size map (one-shot, cache at startup)."""
         return _manager.get_nfo_lot_sizes()

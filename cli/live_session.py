@@ -309,6 +309,7 @@ class KCLILiveSession:
         self.active_positions = []
         self.position_id_map = {}
         self.last_positions_response = None
+        self.last_orders_response = None
         # Margin data keyed by api_key; fetched on order fill.
         self.margins_by_api_key: dict = {}
         # NFO tradingsymbol → lot_size; fetched once by kite_manager, cached there.
@@ -320,6 +321,7 @@ class KCLILiveSession:
         self.selected_account_name = None
         self.selected_account_api_key = None
         self.pending_order = None
+        self.selected_order = None
 
         # Info pane state
         # mode: "orders_pending" | "orders_executed" | "oc"
@@ -454,7 +456,9 @@ class KCLILiveSession:
 
     def update_prompt_label(self) -> None:
         """Update prompt label based on selected symbol and account contexts."""
-        if self.selected_account_name and self.selected_symbol:
+        if self.selected_order:
+            self.prompt_control.text = f" kcli [@{self.selected_order.get('account_name')}:{self.selected_order.get('order_id')[-6:]}]> "
+        elif self.selected_account_name and self.selected_symbol:
             self.prompt_control.text = f" kcli [@{self.selected_account_name}:{self.selected_symbol}]> "
         elif self.selected_account_name:
             self.prompt_control.text = f" kcli [@{self.selected_account_name}]> "
@@ -479,6 +483,7 @@ class KCLILiveSession:
 
         sym  = getattr(self, "selected_symbol", None)
         acct = getattr(self, "selected_account_name", None)
+        order = getattr(self, "selected_order", None)
 
         # Find matching active position to determine default qty
         matched_pos = None
@@ -527,29 +532,44 @@ class KCLILiveSession:
             return _handler
 
         # Determine snippets based on context
-        if sym:
-            # Context 3: If account and symbol are selected
-            buy_snippet = f"buy {qty}{price_str} "
-            sell_snippet = f"sell {qty}{price_str} "
-        elif acct:
-            # Context 2: If account is selected (but no symbol)
-            buy_snippet = "buy <symbol> <qty> [price] [product]"
-            sell_snippet = "sell <symbol> <qty> [price] [product]"
+        if order:
+            o_id = order.get("order_id")
+            o_qty = order.get("quantity", 1)
+            o_price = order.get("price", 0.0)
+            modify_snippet = f"order {o_id} {o_qty} {o_price:.2f}"
+            cancel_snippet = f"cancel {o_id}"
+            
+            buttons = [
+                ("  MODIFY  ", "class:btn.modify", "bg:#1a1a1a fg:#444444", modify_snippet),
+                ("  CANCEL  ", "class:btn.cancel", "bg:#1a1a1a fg:#444444", cancel_snippet),
+            ]
         else:
-            # Context 1: If nothing is selected
-            buy_snippet = "account <name> && buy <symbol> <qty> [price] [product]"
-            sell_snippet = "account <name> && sell <symbol> <qty> [price] [product]"
+            if sym:
+                # Context 3: If account and symbol are selected
+                buy_snippet = f"buy {qty}{price_str} "
+                sell_snippet = f"sell {qty}{price_str} "
+            elif acct:
+                # Context 2: If account is selected (but no symbol)
+                buy_snippet = "buy <symbol> <qty> [price] [product]"
+                sell_snippet = "sell <symbol> <qty> [price] [product]"
+            else:
+                # Context 1: If nothing is selected
+                buy_snippet = "account <name> && buy <symbol> <qty> [price] [product]"
+                sell_snippet = "account <name> && sell <symbol> <qty> [price] [product]"
 
-        # ── button definitions: (label, active_style, dim_style, snippet) ──
-        buttons = [
-            ("  BUY  ", "bg:#005f00 fg:#afffaf bold", "bg:#1a1a1a fg:#444444", buy_snippet),
-            ("  SELL  ", "bg:#5f0000 fg:#ffafaf bold", "bg:#1a1a1a fg:#444444", sell_snippet),
-        ]
+            # ── button definitions: (label, active_style, dim_style, snippet) ──
+            buttons = [
+                ("  BUY  ", "bg:#005f00 fg:#afffaf bold", "bg:#1a1a1a fg:#444444", buy_snippet),
+                ("  SELL  ", "bg:#5f0000 fg:#ffafaf bold", "bg:#1a1a1a fg:#444444", sell_snippet),
+            ]
 
         frags = []
 
         # Left label — show selected context or neutral hint
-        if sym:
+        if order:
+            ctx = f"Order:{order.get('order_id')[-6:]} @{order.get('account_name')}"
+            frags.append(("bg:#262626 fg:#00afaf bold", f"  [{ctx}] "))
+        elif sym:
             ctx = sym + (f" @{acct}" if acct else "")
             frags.append(("bg:#262626 fg:#00afaf bold", f"  [{ctx}] "))
         elif acct:
@@ -587,6 +607,7 @@ class KCLILiveSession:
                         self.selected_symbol = pos.get("tradingsymbol")
                         self.selected_account_api_key = pos.get("api_key")
                         self.selected_account_name = pos.get("account_name")
+                        self.selected_order = None
                         self.update_prompt_label()
                         self.log_message(f"Selected [bold]{self.selected_symbol}[/bold] (@{self.selected_account_name}) via click.")
                         if hasattr(self, "app"):
@@ -608,6 +629,7 @@ class KCLILiveSession:
                 if self.selected_account_api_key != acct.get("api_key"):
                     self.selected_account_name = acct.get("name")
                     self.selected_account_api_key = acct.get("api_key")
+                    self.selected_order = None
                     self.update_prompt_label()
                     self.log_message(f"Selected account [bold]@{self.selected_account_name}[/bold] via click.")
                     if hasattr(self, "app"):
@@ -1163,6 +1185,7 @@ class KCLILiveSession:
             self._update_subscriptions(new_tokens)
 
         if isinstance(orders_resp, dict):
+            self.last_orders_response = orders_resp
             self._last_pending_text  = self._render_orders_pane(orders_resp, "orders_pending")
             self._last_executed_text = self._render_orders_pane(orders_resp, "orders_executed")
             if self.info_mode in ("orders_pending", "orders_executed"):
@@ -1225,6 +1248,46 @@ class KCLILiveSession:
 
         # No match in active positions — pass through as-is (for new orders)
         return normalized_input, None, None
+
+    def _find_pending_order(self, query: str) -> tuple[tuple[dict, dict] | None, str | None]:
+        """Find a pending order in self.last_orders_response by ID or suffix.
+
+        Returns:
+            ((account, order), None) if a unique match is found,
+            (None, error_message) otherwise.
+        """
+        if not getattr(self, "last_orders_response", None):
+            return None, "No orders cache available. Please wait for a refresh."
+
+        PENDING_STATUSES = {"OPEN", "TRIGGER PENDING", "AMO REQ RECEIVED", "PUT ORDER REQ RECEIVED"}
+        matches = []
+        
+        # Normalize the query (strip whitespace)
+        normalized_query = query.strip()
+        if not normalized_query:
+            return None, "Empty order search query."
+
+        for acct in self.last_orders_response.get("accounts", []):
+            for o in acct.get("orders", []):
+                if o.get("status", "").upper() in PENDING_STATUSES:
+                    order_id = str(o.get("order_id", ""))
+                    # Check exact match, ends with match, or general substring
+                    if order_id == normalized_query or order_id.endswith(normalized_query) or (len(normalized_query) >= 4 and normalized_query in order_id):
+                        matches.append((acct, o))
+
+        if not matches:
+            return None, f"No pending order matches '{query}'."
+
+        if len(matches) > 1:
+            # Check if there is an exact endswith match with the suffix
+            exact_matches = [m for m in matches if m[1].get("order_id", "").endswith(normalized_query)]
+            if len(exact_matches) == 1:
+                return exact_matches[0], None
+            
+            desc = ", ".join(m[1].get("order_id") for m in matches)
+            return None, f"Multiple pending orders match '{query}': {desc}. Please be more specific."
+
+        return matches[0], None
 
     def resolve_account(self, input_acc: str) -> tuple[dict | None, str | None]:
         """Resolve an account name, 1-based index, or API key.
@@ -1452,6 +1515,88 @@ class KCLILiveSession:
 
         except KCLIClientError as exc:
             self.log_message(f"[#ff0000]Exit Execution Failed:[/#] {exc}")
+
+    async def execute_modify(self, order_id: str, qty_str: str, price_str: str, api_key: str) -> None:
+        """Modify open order in executor."""
+        # 1. Validate quantity
+        try:
+            qty = int(qty_str)
+            if qty <= 0:
+                raise ValueError("Quantity must be positive.")
+        except ValueError:
+            self.log_message(f"[#ff0000]Error:[/#] Invalid quantity '{qty_str}'. Must be a positive integer.")
+            return
+
+        # 2. Parse price
+        price = None
+        order_type = "LIMIT"
+        if price_str:
+            try:
+                price = float(price_str)
+                if price <= 0:
+                    price = None
+                    order_type = "MARKET"
+            except ValueError:
+                self.log_message(f"[#ff0000]Error:[/#] Invalid price '{price_str}'. Must be a positive float.")
+                return
+
+        self.log_message(f"Modifying order {order_id} to quantity {qty} @ {price or 'MARKET'}...")
+
+        try:
+            response = await self._run_api_call(
+                self.client.modify_order,
+                api_key=api_key,
+                order_id=order_id,
+                quantity=qty,
+                price=price,
+                order_type=order_type,
+            )
+            
+            status = response.get("status", "error")
+            msg = response.get("message", "")
+            if status == "success":
+                self.log_message(f"[#00ff00]✓ Order modified successfully.[/#] ID: {order_id}")
+                # Clear order selection after successful modification
+                if self.selected_order and self.selected_order.get("order_id") == order_id:
+                    self.selected_order = None
+                    self.update_prompt_label()
+                # Trigger a refresh to show updated orders/positions
+                if hasattr(self, "app") and self.app and self.app.loop:
+                    asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+            else:
+                self.log_message(f"[#ff0000]✗ Modify failed:[/#] {msg}")
+
+        except Exception as exc:
+            self.log_message(f"[#ff0000]Modify Execution Failed:[/#] {exc}")
+
+    async def execute_cancel(self, order_id: str, api_key: str) -> None:
+        """Cancel open order in executor."""
+        self.log_message(f"Cancelling order {order_id}...")
+
+        try:
+            response = await self._run_api_call(
+                self.client.cancel_order,
+                api_key=api_key,
+                order_id=order_id,
+            )
+            
+            status = response.get("status", "error")
+            msg = response.get("message", "")
+            if status == "success":
+                self.log_message(f"[#00ff00]✓ Order cancelled successfully.[/#] ID: {order_id}")
+                # Clear order selection after successful cancellation
+                if self.selected_order and self.selected_order.get("order_id") == order_id:
+                    self.selected_order = None
+                    self.update_prompt_label()
+                # Trigger a refresh to show updated orders/positions
+                if hasattr(self, "app") and self.app and self.app.loop:
+                    asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
+            else:
+                self.log_message(f"[#ff0000]✗ Cancel failed:[/#] {msg}")
+
+        except Exception as exc:
+            self.log_message(f"[#ff0000]Cancel Execution Failed:[/#] {exc}")
+
     def handle_input(self, buffer) -> None:
         """Process entered command line with error safety wrapper."""
         try:
@@ -1484,6 +1629,22 @@ class KCLILiveSession:
                 p = self.pending_order
                 if p["type"] == "exit":
                     asyncio.create_task(self.execute_exit(p["symbol"], p.get("api_keys", [])))
+                elif p["type"] == "modify":
+                    asyncio.create_task(
+                        self.execute_modify(
+                            p["order_id"],
+                            p["qty"],
+                            p["price"],
+                            p["api_key"],
+                        )
+                    )
+                elif p["type"] == "cancel":
+                    asyncio.create_task(
+                        self.execute_cancel(
+                            p["order_id"],
+                            p["api_key"],
+                        )
+                    )
                 else:
                     asyncio.create_task(
                         self.execute_order(
@@ -1570,14 +1731,15 @@ class KCLILiveSession:
             self.selected_symbol = None
             self.selected_account_name = None
             self.selected_account_api_key = None
+            self.selected_order = None
             self.update_prompt_label()
             self.log_message("Selection cleared.")
             return
 
-        # Select Position / Account Command
+        # Select Position / Account / Order Command
         if primary_cmd in ("select", "s"):
             if len(parts) < 2:
-                self.log_message("[#ff0000]Usage:[/#] select <id|none> OR select account <name|index|none>")
+                self.log_message("[#ff0000]Usage:[/#] select <id|none> OR select order <id_suffix|none> OR select account <name|index|none>")
                 return
             
             raw_id = parts[1]
@@ -1591,6 +1753,7 @@ class KCLILiveSession:
                 if raw_acc.lower() in ("none", "clear", "null", "empty", "all"):
                     self.selected_account_name = None
                     self.selected_account_api_key = None
+                    self.selected_order = None
                     self.update_prompt_label()
                     self.log_message("Account selection cleared (orders will target all accounts).")
                     return
@@ -1602,14 +1765,53 @@ class KCLILiveSession:
                 
                 self.selected_account_name = acct.get("name")
                 self.selected_account_api_key = acct.get("api_key")
+                self.selected_order = None
                 self.update_prompt_label()
                 self.log_message(f"Selected account: [bold]{self.selected_account_name}[/bold]. Orders will target this account only.")
+                return
+
+            # Check if selecting an order: select order <id_suffix> or s o <id_suffix>
+            if raw_id.lower() in ("order", "ord", "o"):
+                if len(parts) < 3:
+                    self.log_message("[#ff0000]Usage:[/#] select order <id_suffix|none>")
+                    return
+                raw_ord = parts[2]
+                if raw_ord.lower() in ("none", "clear", "null", "empty"):
+                    self.selected_order = None
+                    self.update_prompt_label()
+                    self.log_message("Order selection cleared.")
+                    return
+                
+                acct_and_order, err = self._find_pending_order(raw_ord)
+                if err:
+                    self.log_message(f"[#ff0000]Error:[/#] {err}")
+                    return
+                
+                acct, order = acct_and_order
+                self.selected_order = {
+                    "order_id": order.get("order_id"),
+                    "tradingsymbol": order.get("tradingsymbol"),
+                    "transaction_type": order.get("transaction_type"),
+                    "quantity": order.get("quantity"),
+                    "price": order.get("price"),
+                    "order_type": order.get("order_type"),
+                    "product": order.get("product"),
+                    "api_key": acct.get("api_key"),
+                    "account_name": acct.get("name")
+                }
+                
+                # Clear active symbol selection to avoid confusion
+                self.selected_symbol = None
+                
+                self.update_prompt_label()
+                self.log_message(f"Selected pending order [bold]{self.selected_order['order_id']}[/bold] ({self.selected_order['tradingsymbol']} | {self.selected_order['transaction_type']} | {self.selected_order['quantity']} @ {self.selected_order['price']:.2f}) on @{self.selected_order['account_name']}.")
                 return
                 
             if raw_id.lower() in ("none", "clear", "null", "empty"):
                 self.selected_symbol = None
                 self.selected_account_name = None
                 self.selected_account_api_key = None
+                self.selected_order = None
                 self.update_prompt_label()
                 self.log_message("Selection cleared.")
                 return
@@ -1620,6 +1822,7 @@ class KCLILiveSession:
                 return
             
             self.selected_symbol = symbol
+            self.selected_order = None
             if api_key:
                 self.selected_account_api_key = api_key
                 for acct in self.accounts:
@@ -1640,6 +1843,7 @@ class KCLILiveSession:
             if raw_acc.lower() in ("none", "clear", "null", "empty", "all"):
                 self.selected_account_name = None
                 self.selected_account_api_key = None
+                self.selected_order = None
                 self.update_prompt_label()
                 self.log_message("Account selection cleared (orders will target all accounts).")
                 return
@@ -1651,73 +1855,96 @@ class KCLILiveSession:
             
             self.selected_account_name = acct.get("name")
             self.selected_account_api_key = acct.get("api_key")
+            self.selected_order = None
             self.update_prompt_label()
             self.log_message(f"Selected account: [bold]{self.selected_account_name}[/bold]. Orders will target this account only.")
             return
 
-        # Place Order Command (Legacy/Alternative)
+        # Modify Order Command: order <id_suffix|full_id> <quantity|lotsL> <price>
         if primary_cmd == "order":
-            # Find the transaction type (BUY/SELL) index to handle multi-word symbols like "23500 CE"
-            tx_type_idx = -1
-            for idx, part in enumerate(parts):
-                if part.lower() in ("buy", "sell"):
-                    tx_type_idx = idx
-                    break
-            
-            if tx_type_idx == -1 or tx_type_idx < 2 or len(parts) <= tx_type_idx + 1:
-                self.log_message("[#ff0000]Usage:[/#] order <symbol> <buy|sell> <qty> [price] [product]")
+            if len(parts) < 4:
+                self.log_message("[#ff0000]Usage:[/#] order <id_suffix|full_id> <quantity|lotsL> <price>")
                 return
-
-            # Parse parameters
-            raw_symbol = " ".join(parts[1:tx_type_idx])
-            transaction_type = parts[tx_type_idx].lower()
-            qty_str = parts[tx_type_idx + 1]
             
-            price_str = None
-            if len(parts) > tx_type_idx + 2:
-                price_str = parts[tx_type_idx + 2]
-                
-            product = "NRML"
-            if len(parts) > tx_type_idx + 3:
-                product = parts[tx_type_idx + 3]
-
-            symbol, api_key, err = self.resolve_symbol(raw_symbol)
+            raw_id = parts[1]
+            qty_str = parts[2]
+            price_str = parts[3]
+            
+            # Find the order in cache using raw_id
+            acct_and_order, err = self._find_pending_order(raw_id)
             if err:
                 self.log_message(f"[#ff0000]Error:[/#] {err}")
                 return
-
-            target_key = api_key or self.selected_account_api_key
-            target_keys = [target_key] if target_key else []
-
-            # Set pending order for confirmation
+                
+            acct, order = acct_and_order
+            order_id = order.get("order_id")
+            symbol = order.get("tradingsymbol")
+            api_key = acct.get("api_key")
+            
+            # Resolve quantity with lot size if it has L
             raw_qty_str, qty_display, qty_err = self._resolve_qty(qty_str, symbol)
             if qty_err:
                 self.log_message(f"[#ff0000]Error:[/#] {qty_err}")
                 return
-
+                
+            # Parse price
+            try:
+                price_val = float(price_str)
+            except ValueError:
+                self.log_message(f"[#ff0000]Error:[/#] Price '{price_str}' must be a float.")
+                return
+                
+            price_desc = f"@{price_val:.2f}" if price_val > 0 else "MARKET"
+            
             self.pending_order = {
-                "symbol": symbol,
-                "type": transaction_type,
+                "type": "modify",
+                "order_id": order_id,
                 "qty": raw_qty_str,
                 "price": price_str,
-                "product": product,
-                "api_keys": target_keys
+                "api_key": api_key,
+                "symbol": symbol
             }
+            
+            self.prompt_control.text = f" Confirm MODIFY order {order_id[-6:]} to {qty_display} {symbol} {price_desc}? (y/n)> "
+            self.log_message(f"[#ff8700]Pending Confirmation:[/#] MODIFY order {order_id} ({symbol}) to {qty_display} {price_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+            return
 
-            if target_keys:
-                names = []
-                for k in target_keys:
-                    for acct in self.accounts:
-                        if acct.get("api_key") == k:
-                            names.append(f"@{acct.get('name')}")
-                            break
-                accts_desc = ", ".join(names)
-            else:
-                accts_desc = "All Accounts"
-
-            price_desc = f"at price {price_str}" if price_str else "at MARKET"
-            self.prompt_control.text = f" Confirm {transaction_type.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}? (y/n)> "
-            self.log_message(f"[#ff8700]Pending Confirmation:[/#] {transaction_type.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+        # Cancel Order Command: cancel [id_suffix|full_id]
+        if primary_cmd == "cancel":
+            target_id = None
+            if len(parts) >= 2:
+                target_id = parts[1]
+            elif self.selected_order:
+                target_id = self.selected_order.get("order_id")
+                
+            if not target_id:
+                self.log_message("[#ff0000]Usage:[/#] cancel <id_suffix|full_id> (or select a pending order first)")
+                return
+                
+            acct_and_order, err = self._find_pending_order(target_id)
+            if err:
+                self.log_message(f"[#ff0000]Error:[/#] {err}")
+                return
+                
+            acct, order = acct_and_order
+            order_id = order.get("order_id")
+            symbol = order.get("tradingsymbol")
+            api_key = acct.get("api_key")
+            qty = order.get("quantity")
+            price = order.get("price")
+            tx_type = order.get("transaction_type")
+            
+            price_desc = f"@{price:.2f}" if price else "MARKET"
+            
+            self.pending_order = {
+                "type": "cancel",
+                "order_id": order_id,
+                "api_key": api_key,
+                "symbol": symbol
+            }
+            
+            self.prompt_control.text = f" Confirm CANCEL order {order_id[-6:]} ({tx_type} {qty} {symbol} {price_desc})? (y/n)> "
+            self.log_message(f"[#ff8700]Pending Confirmation:[/#] CANCEL order {order_id} ({tx_type} {qty} {symbol} {price_desc}). Press [bold]y[/bold] to confirm, any other key to cancel.")
             return
 
         # Direct Buy/Sell Commands
@@ -2458,10 +2685,12 @@ class KCLILiveSession:
             if (
                 (hasattr(self, "selected_symbol") and self.selected_symbol)
                 or (hasattr(self, "selected_account_name") and self.selected_account_name)
+                or (hasattr(self, "selected_order") and self.selected_order)
             ):
                 self.selected_symbol = None
                 self.selected_account_name = None
                 self.selected_account_api_key = None
+                self.selected_order = None
                 self.update_prompt_label()
                 self.log_message("Selection cleared.")
 
