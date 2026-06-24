@@ -124,11 +124,13 @@ class KiteAccountManager:
                 api_key[:8],
             )
             return True
-        except Exception:
+        except Exception as exc:
             logger.error(
-                "Login failed for account '%s' (api_key=%s…)",
+                "Login failed for account '%s' (api_key=%s…): %s",
                 self._account_names.get(api_key, api_key),
                 api_key[:8],
+                exc,
+                exc_info=True,
             )
             self._authenticated[api_key] = False
             return False
@@ -431,8 +433,14 @@ class KiteAccountManager:
             # Step 5: Exchange request_token for access_token
             return self.complete_login(api_key, request_token)
 
-        except Exception:
-            logger.error("Auto-login failed for %s (api_key=%s…)", user_id, api_key[:8])
+        except Exception as exc:
+            logger.error(
+                "Auto-login failed for %s (api_key=%s…): %s",
+                user_id,
+                api_key[:8],
+                exc,
+                exc_info=True,
+            )
             return False
 
     def place_order(

@@ -137,3 +137,42 @@ kcli init
 ## License
 
 MIT
+
+---
+
+## Changelog
+
+### 0.1.0b8 — 2026-06-24
+
+**Bug Fixes:**
+- **Account-aware order routing**: Fixed a bug where clicking an account (e.g. `@SS1009`) correctly updated the TUI context, but placing an order for a symbol that also existed in another account routed the order to that other account. Symbol resolution and action bar position matching are now scoped to the selected account context.
+- **Improved login/auto-login error logging**: `complete_login` and `auto_login` in `kite_manager.py` now log the full exception message and stack trace, making proxy and token failures much easier to diagnose.
+
+**Enhancements:**
+- **Filled quantity display in orders pane**: Both pending (F1) and executed (F2) orders now always show `filled/total` format (e.g. `0/910`, `130/910`, `910/910`) so you can track partial fills at a glance.
+- **Live order update messages**: The WebSocket order update log in the status pane now shows `filled/total` quantity (e.g. `SELL 130/910 NIFTY25JUN25800PE -> OPEN`) in real time as fills arrive.
+
+---
+
+### 0.1.0b7 — 2026-06-19
+
+**Bug Fixes:**
+- **Position price updates via WebSocket**: Position LTPs were not updating in the TUI because `instrument_token` was missing from the dict returned by `get_positions()`. Adding the key allows the WebSocket ticker to correctly map tick data to positions.
+
+**New Features:**
+- **Pending order modification**: Select a pending order (`select order <id>` or `s o <id>`) and use `order <id> <qty> <price>` to modify it, with a double-confirmation prompt before execution.
+- **Pending order cancellation**: Use `cancel [id]` (or click CANCEL after selecting an order) to cancel a pending order with confirmation.
+- **REFRESH button**: A `REFRESH` button on the TUI quick action bar immediately triggers a full sync of positions, orders, margins, and indices across all accounts.
+- **Context-aware MODIFY/CANCEL buttons**: The quick action bar swaps BUY/SELL for MODIFY/CANCEL buttons when a pending order is selected.
+- **ORDERS.md documentation**: Added a comprehensive reference guide for all order types, syntax, lot notation (`L`), command chaining (`&&`), and keyboard shortcuts.
+
+---
+
+### 0.1.0b6 — 2026-06-15
+
+**New Features:**
+- **Command chaining (`&&`)**: Chain multiple commands in a single input, e.g. `account SS1009 && buy SBIN 10`.
+- **Context-aware BUY/SELL buttons**: Action bar buttons dynamically pre-fill order syntax based on whether an account, position, or nothing is selected.
+- **Lot-size notation**: Specify quantities in lots using `L` suffix (e.g. `2L` for 2 lots).
+- **Position ID shortcuts**: Reference positions by their row index number instead of full symbol name.
+

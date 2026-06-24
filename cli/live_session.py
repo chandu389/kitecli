@@ -490,6 +490,8 @@ class KCLILiveSession:
         matched_pos = None
         if sym:
             for pos in getattr(self, "active_positions", []):
+                if self.selected_account_api_key and pos.get("api_key") != self.selected_account_api_key:
+                    continue
                 if pos.get("tradingsymbol", "").upper() == sym.upper():
                     matched_pos = pos
                     break
@@ -1005,9 +1007,11 @@ class KCLILiveSession:
             status = data.get("status")
             symbol = data.get("tradingsymbol")
             qty = data.get("quantity")
+            filled = data.get("filled_quantity", 0)
             ord_type = data.get("transaction_type")
             name = self._get_account_name(api_key)
-            self.log_message(f"[#00afaf]Order update [@{name}]:[/#] {ord_type} {qty} {symbol} -> {status}")
+            qty_desc = f"{filled}/{qty}"
+            self.log_message(f"[#00afaf]Order update [@{name}]:[/#] {ord_type} {qty_desc} {symbol} -> {status}")
             
             # Trigger immediate refresh of positions and orders
             if hasattr(self, "app") and self.app and self.app.loop:
@@ -1245,6 +1249,8 @@ class KCLILiveSession:
         # Exact match against active positions (case-insensitive, spaces stripped)
         matched_pos = None
         for pos in getattr(self, "active_positions", []):
+            if self.selected_account_api_key and pos.get("api_key") != self.selected_account_api_key:
+                continue
             sym = pos.get("tradingsymbol", "")
             if sym.replace(" ", "").upper() == normalized_input:
                 if matched_pos is None:
@@ -2422,7 +2428,8 @@ class KCLILiveSession:
                     else:
                         price_desc = f"@ {price:.2f}" if price else "MARKET"
 
-                    qty_desc = f"{filled}/{qty}" if mode == "orders_executed" else str(qty)
+                    # Always show filled/total format (e.g. 0/910, 130/910, 910/910)
+                    qty_desc = f"{filled}/{qty}"
                     lines.append(
                         f"  [{oid[-6:]}] {tx} {sym} | {qty_desc} | "
                         f"{otype} {price_desc} | {product} | {status}"
