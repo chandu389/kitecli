@@ -142,6 +142,14 @@ MIT
 
 ## Changelog
 
+### 0.1.0b9 — 2026-06-24
+
+**Bug Fixes:**
+- **WebSocket auto-reconnect on network drops**: The `KiteTicker` was previously started without reconnect settings, so a transient TCP drop (error 1006 — peer closed connection) would silently kill the WebSocket permanently, freezing NIFTY indices, position LTPs, and all live data. Reconnect is now enabled with up to **10 attempts** and exponential backoff.
+- **Auth-failure reconnect storm prevention**: If the WebSocket fails due to a 403 / expired token, the ticker now immediately stops reconnecting and shows a clear message (`Run kcli init to re-authenticate`) instead of hammering Zerodha indefinitely.
+
+---
+
 ### 0.1.0b8 — 2026-06-24
 
 **Bug Fixes:**

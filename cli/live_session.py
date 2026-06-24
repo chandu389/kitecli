@@ -931,11 +931,13 @@ class KCLILiveSession:
                         except Exception as p_err:
                             self.log_message(f"[#ff8700]Failed to parse proxy for {acct.get('name')}:[/#] {p_err}")
 
-                    # Run ticker loop in a background thread
+                    # Run ticker loop in a background thread.
+                    # reconnect=True with max_tries=10 handles transient network drops
+                    # (e.g. 1006 TCP close) without hammering Zerodha on auth failures.
+                    connect_kwargs = dict(threaded=True, reconnect=True, reconnect_max_tries=10)
                     if proxy_dict:
-                        ticker.connect(threaded=True, proxy=proxy_dict)
-                    else:
-                        ticker.connect(threaded=True)
+                        connect_kwargs["proxy"] = proxy_dict
+                    ticker.connect(**connect_kwargs)
                     self.tickers[api_key] = ticker
                 except Exception as exc:
                     self.log_message(f"[#ff0000]Failed to connect WebSocket for {acct.get('name')}:[/#] {exc}")
@@ -992,13 +994,37 @@ class KCLILiveSession:
         def on_close(ws, code, reason):
             name = self._get_account_name(api_key)
             if self._ws_should_log(f"close:{api_key}"):
-                self.log_message(f"[#ff8700]WebSocket closed:[/#] @{name} ({code} {reason})")
+                self.log_message(
+                    f"[#ff8700]WebSocket closed:[/#] @{name} ({code} {reason}) "
+                    f"— reconnecting..."
+                )
         return on_close
 
     def _make_on_error(self, api_key: str):
         def on_error(ws, code, reason):
             name = self._get_account_name(api_key)
-            if self._ws_should_log(f"error:{api_key}"):
+            reason_str = str(reason).lower()
+            # Detect permanent auth failures (403, token expired) — stop reconnecting
+            # immediately to avoid hammering Zerodha and getting rate-limited.
+            is_auth_failure = (
+                code == 403
+                or "403" in reason_str
+                or "auth_failed" in reason_str
+                or "token" in reason_str
+            )
+            if is_auth_failure:
+                self.log_message(
+                    f"[#ff0000]WebSocket auth failed:[/#] @{name} — token expired or invalid. "
+                    f"Run [bold]kcli init[/bold] to re-authenticate."
+                )
+                # Stop reconnecting — close the ticker cleanly
+                ticker = self.tickers.get(api_key)
+                if ticker:
+                    try:
+                        ticker.close()
+                    except Exception:
+                        pass
+            elif self._ws_should_log(f"error:{api_key}"):
                 self.log_message(f"[#ff0000]WebSocket error:[/#] @{name} ({code} {reason})")
         return on_error
 
