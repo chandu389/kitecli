@@ -26,6 +26,10 @@ A multi-account Zerodha Kite Connect trading positions viewer with a beautiful i
 - 📡 **Live WebSocket Streaming**: Position LTPs/P&L, the market indices panel, and the option chain all update in real time over the Kite WebSocket (`KiteTicker`) — no manual refresh needed. Order fills push an instant positions/orders re-sync.
 - 🎯 **Primary Streaming Account**: Market data (indices, option chain, and position prices) is streamed through a single designated *primary* account instead of redundantly subscribing on every account. Mark one account with `primary: true` in the config, or let `kcli` auto-select the first streaming-capable account. Per-account positions, orders, and P&L remain fully independent.
 - 🩺 **Streaming Diagnostics**: On startup, `kcli` probes each account's WebSocket authentication. Accounts whose `api_key` lacks an active streaming subscription (REST works but the ticker is rejected with `403`) are reported clearly and skipped, preventing reconnect-error storms.
+- 🤖 **Gemini Natural Language Interface (NLI) [Very Basic]**: Prefix commands with `/` (e.g., `/exit weekly options on zk`) to translate conversational queries into explicit chained `kcli` orders. Runs 100% offline for symbol lookup using active positions, and is powered by Google's Gemini 2.5 Flash Cloud API. *(Requires setting `gemini_api_key` in config.yaml)*.
+- 🧹 **Action Bar SQUAREOFF Button**: Dedicated purple action button that pre-fills the `exit near-week` command, letting you exit all near-week weekly options on selected or all accounts concurrently with double confirmation.
+- 💾 **SQLite Session Recorder**: Logs positions, orders, and market indices snapshots context to a local `~/.kcli/data.db` database in the background for trading performance analytics.
+- 📈 **Tuesday Strangle Advisor**: Displays capital allocations, lot sizes, and copy-paste execution stages on Tuesdays in the Info Pane (`F4`).
 
 ---
 
@@ -141,6 +145,22 @@ MIT
 ---
 
 ## Changelog
+
+### 0.1.0b11 — 2026-06-28
+
+**New Features:**
+- **Action Bar SQUAREOFF Button**: Purple button pre-filling the `exit near-week` command to square off near-week weekly options on selected or all accounts concurrently.
+- **Natural Language Interface (NLI) [Very Basic]**: Translates slash (`/`) command requests into kcli chained orders. Runs 100% offline for symbol lookup using active positions, and routes queries through the Gemini 2.5 Flash API.
+- **SQLite Session Recorder**: Background thread records order executions, positions, and market indices snapshots metadata to `~/.kcli/data.db` for trade performance reporting.
+- **Tuesday Option Strangle Advisor**: Dynamic capital allocation and lot sizing plan mapped to F4 key.
+
+**Bug Fixes:**
+- **Proxy Bypass & IPv4 DNS lookup patch**: Patched the NLI network call to force IPv4 DNS queries and bypass local terminal proxies, reducing Gemini API lookup latency from 2400ms to 2ms on macOS.
+- **Spacious 3-Row Prompt Height**: Expanded the command input row statically to 3 lines with text wrapping enabled, so long chained commands and confirmations are fully readable.
+- **Authentication Client Method**: Added the missing `is_authenticated` helper method to the `KCLIClient` wrapper.
+- **Advisor Singleton Import path**: Resolved the `_manager` import exception in `cli/advisor.py` by directing it to the correct singleton location in `cli/api_client.py`.
+
+---
 
 ### 0.1.0b10 — 2026-06-25
 

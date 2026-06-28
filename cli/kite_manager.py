@@ -159,28 +159,35 @@ class KiteAccountManager:
             # Combine day and net positions; net is the primary view
             all_positions = positions_data.get("net", [])
 
-            open_positions = []
+            ret_positions = []
             for pos in all_positions:
-                if pos.get("quantity", 0) != 0:
-                    open_positions.append(
-                        {
-                            "tradingsymbol": pos.get("tradingsymbol", ""),
-                            "quantity": pos.get("quantity", 0),
-                            "average_price": pos.get("average_price", 0.0),
-                            "last_price": pos.get("last_price", 0.0),
-                            "pnl": pos.get("pnl", 0.0),
-                            "product": pos.get("product", ""),
-                            "exchange": pos.get("exchange", ""),
-                            "instrument_token": pos.get("instrument_token"),
-                        }
-                    )
+                qty = pos.get("quantity", 0)
+                avg_price = pos.get("average_price", 0.0)
+                pnl = pos.get("pnl", 0.0)
+                pnl_pct = (pnl / (avg_price * abs(qty))) * 100 if avg_price > 0 and qty != 0 else 0.0
+
+                ret_positions.append(
+                    {
+                        "tradingsymbol": pos.get("tradingsymbol", ""),
+                        "quantity": qty,
+                        "average_price": avg_price,
+                        "last_price": pos.get("last_price", 0.0),
+                        "pnl": pnl,
+                        "realised": pos.get("realised", 0.0),
+                        "unrealised": pos.get("unrealised", 0.0),
+                        "pnl_pct": pnl_pct,
+                        "product": pos.get("product", ""),
+                        "exchange": pos.get("exchange", ""),
+                        "instrument_token": pos.get("instrument_token"),
+                    }
+                )
 
             logger.info(
-                "Fetched %d open positions for api_key=%s…",
-                len(open_positions),
+                "Fetched %d net positions for api_key=%s…",
+                len(ret_positions),
                 api_key[:8],
             )
-            return open_positions
+            return ret_positions
         except Exception as exc:
             logger.error(
                 "Failed to fetch positions for api_key=%s…", api_key[:8]
@@ -443,6 +450,12 @@ class KiteAccountManager:
             )
             return False
 
+    # Maximum quantity per single order leg.  Zerodha rejects NFO orders
+    # above the exchange-defined freeze quantity (e.g. 1800 for NIFTY).
+    # We use a slightly conservative default so the split fires before the
+    # exchange-level rejection.
+    FREEZE_QTY_LIMIT: int = 1755
+
     def place_order(
         self,
         api_key: str,
@@ -454,29 +467,34 @@ class KiteAccountManager:
         price: float | None = None,
         trigger_price: float | None = None,
         product: str = "NRML",
-    ) -> str:
+    ) -> list[str]:
         """Place an order for a specific account.
+
+        If *quantity* exceeds ``FREEZE_QTY_LIMIT`` the order is automatically
+        split into multiple legs of at most ``FREEZE_QTY_LIMIT`` each.
 
         Args:
             api_key: The Kite Connect API key.
             tradingsymbol: The symbol to trade (e.g. INFY, NIFTY2662325000CE).
             exchange: The exchange (e.g. NSE, NFO).
             transaction_type: BUY or SELL.
-            quantity: Order quantity.
+            quantity: Total order quantity (will be split if necessary).
             order_type: MARKET, LIMIT, SL, SL-M.
             price: Order price (required for LIMIT/SL orders).
             trigger_price: Trigger price (required for SL/SL-M orders).
             product: MIS, NRML, CNC.
 
         Returns:
-            The order ID.
+            A list of order IDs (one per leg).
         """
         kite = self._clients.get(api_key)
         if not kite:
             raise ValueError(f"Account not found for api_key={api_key[:8]}…")
 
         if not self.is_authenticated(api_key):
-            raise RuntimeError(f"Account '{self._account_names.get(api_key, api_key)}' is not authenticated.")
+            raise RuntimeError(
+                f"Account '{self._account_names.get(api_key, api_key)}' is not authenticated."
+            )
 
         # Normalize parameters (uppercase strings)
         transaction_type = transaction_type.upper()
@@ -485,40 +503,68 @@ class KiteAccountManager:
         exchange = exchange.upper()
         tradingsymbol = tradingsymbol.upper()
 
-        # place_order arguments
-        params = {
-            "variety": kite.VARIETY_REGULAR,
-            "exchange": exchange,
-            "tradingsymbol": tradingsymbol,
-            "transaction_type": transaction_type,
-            "quantity": quantity,
-            "product": product,
-            "order_type": order_type,
-            "validity": kite.VALIDITY_DAY,
-        }
+        # Split quantity into legs of at most FREEZE_QTY_LIMIT
+        legs: list[int] = []
+        remaining = quantity
+        while remaining > 0:
+            leg_qty = min(remaining, self.FREEZE_QTY_LIMIT)
+            legs.append(leg_qty)
+            remaining -= leg_qty
 
-        if price is not None and price > 0:
-            params["price"] = price
-        if trigger_price is not None and trigger_price > 0:
-            params["trigger_price"] = trigger_price
+        total_legs = len(legs)
+        if total_legs > 1:
+            logger.info(
+                "Splitting %s %s order for %d %s into %d legs: %s (freeze limit=%d)",
+                order_type, transaction_type, quantity, tradingsymbol,
+                total_legs, legs, self.FREEZE_QTY_LIMIT,
+            )
 
-        logger.info(
-            "Placing %s %s order for %d %s on %s (%s) for account '%s'",
-            order_type,
-            transaction_type,
-            quantity,
-            tradingsymbol,
-            exchange,
-            product,
-            self._account_names.get(api_key, api_key),
-        )
+        order_ids: list[str] = []
+        for i, leg_qty in enumerate(legs):
+            # Build order parameters
+            params = {
+                "variety": kite.VARIETY_REGULAR,
+                "exchange": exchange,
+                "tradingsymbol": tradingsymbol,
+                "transaction_type": transaction_type,
+                "quantity": leg_qty,
+                "product": product,
+                "order_type": order_type,
+                "validity": kite.VALIDITY_DAY,
+            }
 
-        try:
-            order_id = kite.place_order(**params)
-            return order_id
-        except Exception as exc:
-            logger.error("Failed to place order for api_key=%s…", api_key[:8])
-            raise RuntimeError(f"Failed to place order: {exc}") from exc
+            if price is not None and price > 0:
+                params["price"] = price
+            if trigger_price is not None and trigger_price > 0:
+                params["trigger_price"] = trigger_price
+
+            leg_desc = f" (leg {i + 1}/{total_legs})" if total_legs > 1 else ""
+            logger.info(
+                "Placing %s %s order for %d %s on %s (%s) for account '%s'%s",
+                order_type,
+                transaction_type,
+                leg_qty,
+                tradingsymbol,
+                exchange,
+                product,
+                self._account_names.get(api_key, api_key),
+                leg_desc,
+            )
+
+            try:
+                order_id = kite.place_order(**params)
+                order_ids.append(str(order_id))
+            except Exception as exc:
+                logger.error(
+                    "Failed to place order%s for api_key=%s…: %s",
+                    leg_desc, api_key[:8], exc,
+                )
+                raise RuntimeError(
+                    f"Failed to place order{leg_desc}: {exc}"
+                    + (f" ({len(order_ids)}/{total_legs} legs placed successfully)" if total_legs > 1 else "")
+                ) from exc
+
+        return order_ids
 
     def exit_positions(
         self,
@@ -903,10 +949,11 @@ class KiteAccountManager:
             net = data.get("net")
             # live_balance is the real-time available cash, not the stale opening_balance
             cash = data.get("available", {}).get("live_balance")
-            return {"net": net, "cash": cash}
+            collateral = data.get("available", {}).get("collateral")
+            return {"net": net, "cash": cash, "collateral": collateral}
         except Exception as exc:
             logger.warning("get_margins failed for api_key=%s…: %s", api_key[:8], exc)
-            return {"net": None, "cash": None}
+            return {"net": None, "cash": None, "collateral": None}
 
     def get_nfo_lot_sizes(self) -> dict[str, int]:
         """Return the cached NFO tradingsymbol → lot_size map.

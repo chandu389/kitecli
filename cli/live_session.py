@@ -23,6 +23,8 @@ from prompt_toolkit.data_structures import Point
 
 from cli.api_client import KCLIClient, KCLIClientError
 from cli.display import render_positions_to_string
+from cli.recorder import DataRecorder
+import json
 
 logger = logging.getLogger(__name__)
 
@@ -323,12 +325,33 @@ class KCLILiveSession:
         self.pending_order = None
         self.selected_order = None
 
+        # Build account api_key -> user_id mapping
+        self.api_key_to_user_id = {
+            a.get("api_key"): a.get("user_id", "UNKNOWN")
+            for a in accounts
+            if a.get("api_key")
+        }
+
+        # Initialize and start SQLite recorder
+        self.recorder = DataRecorder()
+        self.recorder.start()
+
         # Info pane state
-        # mode: "orders_pending" | "orders_executed" | "oc"
+        # mode: "orders_pending" | "orders_executed" | "oc" | "advisor"
         self.info_mode: str = "orders_pending"
         self._last_oc_text: str = "Press F3 or run 'oc <UNDERLYING>' to fetch option chain."
         self._last_pending_text: str = "Fetching pending orders..."
         self._last_executed_text: str = "Fetching executed orders..."
+        self._last_advisor_text: str = "Press F4 to view Tuesday Option Strangle Advisor plan."
+        self._advisor_alerted_today: str | None = None
+        self._last_advisor_time_check: float = 0.0
+
+        # Load Gemini API key
+        import os
+        from cli.config import load_config
+        cfg = load_config() or {}
+        self.gemini_api_key = cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY")
+        self._skip_confirmation: bool = False
 
         # Pane resize state (adjusted via Ctrl+arrows)
         self.left_width_pct: int = 50   # % of terminal width for left pane (20–80)
@@ -572,6 +595,7 @@ class KCLILiveSession:
             buttons = [
                 ("  BUY  ", "bg:#005f00 fg:#afffaf bold", "bg:#1a1a1a fg:#444444", buy_snippet),
                 ("  SELL  ", "bg:#5f0000 fg:#ffafaf bold", "bg:#1a1a1a fg:#444444", sell_snippet),
+                ("  SQUAREOFF  ", "bg:#800080 fg:#ffcfff bold", "bg:#1a1a1a fg:#444444", "exit near-week"),
                 ("  REFRESH  ", "class:btn.refresh", "bg:#1a1a1a fg:#444444", "refresh"),
             ]
 
@@ -679,8 +703,15 @@ class KCLILiveSession:
             return
         self._positions_cache_key = cache_key
 
+        # Filter accounts' positions to only include non-zero quantity for the TUI rendering
+        filtered_accounts = []
+        for acct in self.last_positions_response.get("accounts", []):
+            filtered_acct = dict(acct)
+            filtered_acct["positions"] = [p for p in acct.get("positions", []) if p.get("quantity", 0) != 0]
+            filtered_accounts.append(filtered_acct)
+
         rendered = render_positions_to_string(
-            self.last_positions_response.get("accounts", []),
+            filtered_accounts,
             width=width,
             show_indices=True
         )
@@ -1044,6 +1075,11 @@ class KCLILiveSession:
             qty_desc = f"{filled}/{qty}"
             self.log_message(f"[#00afaf]Order update [@{name}]:[/#] {ord_type} {qty_desc} {symbol} -> {status}")
             
+            # Record order update to database
+            if hasattr(self, "recorder"):
+                user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
+                self.recorder.enqueue_order(data, self.index_values, user_id)
+
             # Trigger immediate refresh of positions and orders
             if hasattr(self, "app") and self.app and self.app.loop:
                 asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
@@ -1082,14 +1118,16 @@ class KCLILiveSession:
                         for pos in acct.get("positions", []):
                             if pos.get("instrument_token") == token:
                                 pos["last_price"] = ltp
-                                # Recalculate P&L
-                                avg_price = pos.get("average_price", 0.0)
+                                # Recalculate P&L only for open positions (quantity != 0)
                                 qty = pos.get("quantity", 0)
-                                pos["pnl"] = (ltp - avg_price) * qty
-                                if avg_price > 0:
-                                    pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
-                                else:
-                                    pos["pnl_pct"] = 0.0
+                                if qty != 0:
+                                    avg_price = pos.get("average_price", 0.0)
+                                    pos["pnl"] = (ltp - avg_price) * qty
+                                    if avg_price > 0:
+                                        pos["pnl_pct"] = (pos["pnl"] / (avg_price * abs(qty))) * 100
+                                    else:
+                                        pos["pnl_pct"] = 0.0
+                                # For closed positions, realised P&L remains unchanged and is already set.
                                 updated = True
                         
                         # Recalculate total P&L for account
@@ -1228,6 +1266,14 @@ class KCLILiveSession:
                             new_tokens.add(int(pos["instrument_token"]))
 
             self._update_subscriptions(new_tokens)
+
+            # Record position snapshots to database
+            if hasattr(self, "recorder"):
+                for acct in response.get("accounts", []):
+                    api_key = acct.get("api_key", "")
+                    user_id = self.api_key_to_user_id.get(api_key, "UNKNOWN")
+                    positions = acct.get("positions", [])
+                    self.recorder.enqueue_positions(positions, self.index_values, user_id)
 
         if isinstance(orders_resp, dict):
             self.last_orders_response = orders_resp
@@ -1516,9 +1562,13 @@ class KCLILiveSession:
                 name = res.get("name", "Unknown")
                 status = res.get("status", "error")
                 msg = res.get("message", "")
+                legs = res.get("legs", 1)
                 ord_id = res.get("order_id")
                 if status == "success":
-                    self.log_message(f"[#00ff00]✓ {name}:[/#] Placed. ID: {ord_id}")
+                    if legs > 1:
+                        self.log_message(f"[#00ff00]✓ {name}:[/#] Split into {legs} legs. IDs: {ord_id}")
+                    else:
+                        self.log_message(f"[#00ff00]✓ {name}:[/#] Placed. ID: {ord_id}")
                 else:
                     self.log_message(f"[#ff0000]✗ {name}:[/#] Failed — {msg}")
 
@@ -1644,6 +1694,20 @@ class KCLILiveSession:
         except Exception as exc:
             self.log_message(f"[#ff0000]Cancel Execution Failed:[/#] {exc}")
 
+    def _log_command(self, cmd_text: str, action: dict | str, status: str, result: str | None = None, api_key: str | None = None) -> None:
+        if not hasattr(self, "recorder"):
+            return
+        user_id = self.api_key_to_user_id.get(api_key) if api_key else None
+        parsed_str = json.dumps(action) if isinstance(action, dict) else str(action)
+        self.recorder.enqueue_command(
+            command_text=cmd_text,
+            parsed_action=parsed_str,
+            status=status,
+            result_message=result,
+            index_values=self.index_values,
+            user_id=user_id,
+        )
+
     def handle_input(self, buffer) -> None:
         """Process entered command line with error safety wrapper."""
         try:
@@ -1671,11 +1735,25 @@ class KCLILiveSession:
         # Check if we are waiting for confirmation of a pending order
         if hasattr(self, "pending_order") and self.pending_order:
             ans = cmd.lower().strip()
+            p = self.pending_order
+            
+            # Reset confirmation state upfront so nested commands are not intercepted
+            self.pending_order = None
+            self.update_prompt_label()
+
             if ans in ("y", "yes"):
                 self.log_message("[#00ff00]Order Confirmed.[/#]")
-                p = self.pending_order
+                self._log_command(
+                    cmd_text=f"confirm: {ans}",
+                    action={"confirmed_action": p},
+                    status="success",
+                    api_key=p.get("api_key") if p.get("api_key") else (p.get("api_keys")[0] if p.get("api_keys") else None),
+                )
                 if p["type"] == "exit":
                     asyncio.create_task(self.execute_exit(p["symbol"], p.get("api_keys", [])))
+                elif p["type"] == "exit_near_week":
+                    for sym in p["symbols"]:
+                        asyncio.create_task(self.execute_exit(sym, p.get("api_keys", [])))
                 elif p["type"] == "modify":
                     asyncio.create_task(
                         self.execute_modify(
@@ -1692,6 +1770,16 @@ class KCLILiveSession:
                             p["api_key"],
                         )
                     )
+                elif p["type"] == "nli_command":
+                    self.log_message(f"Executing NLI Command: [bold]{p['command']}[/bold]")
+                    self._skip_confirmation = True
+                    try:
+                        for sub_cmd in p["command"].split(" && "):
+                            sub_cmd = sub_cmd.strip()
+                            if sub_cmd:
+                                self._execute_single_command(sub_cmd)
+                    finally:
+                        self._skip_confirmation = False
                 else:
                     asyncio.create_task(
                         self.execute_order(
@@ -1705,17 +1793,25 @@ class KCLILiveSession:
                     )
             else:
                 self.log_message("[#ff5555]Order Cancelled.[/#]")
-            
-            # Reset confirmation state
-            self.pending_order = None
-            # Restore prompt
-            self.update_prompt_label()
+                self._log_command(
+                    cmd_text=f"confirm: {ans}",
+                    action={"cancelled_action": p},
+                    status="cancelled",
+                    api_key=p.get("api_key") if p.get("api_key") else (p.get("api_keys")[0] if p.get("api_keys") else None),
+                )
+            return
+
+        if cmd.startswith("/"):
+            nli_text = cmd[1:].strip()
+            if nli_text:
+                asyncio.create_task(self.resolve_nli_command(nli_text))
             return
 
         parts = cmd.split()
         primary_cmd = parts[0].lower()
 
         if primary_cmd == "quit" and len(parts) == 1:
+            self._log_command(cmd, "quit", "success")
             self.running = False
             self.app.exit()
             return
@@ -1723,19 +1819,28 @@ class KCLILiveSession:
         if primary_cmd == "exit" and len(parts) == 1:
             if hasattr(self, "selected_symbol") and self.selected_symbol:
                 target_keys = [self.selected_account_api_key] if self.selected_account_api_key else []
+                self._log_command(
+                    cmd_text=cmd,
+                    action={"action": "exit_selected_symbol", "symbol": self.selected_symbol},
+                    status="success",
+                    api_key=self.selected_account_api_key,
+                )
                 asyncio.create_task(self.execute_exit(self.selected_symbol, target_keys))
                 return
             else:
+                self._log_command(cmd, "quit_via_exit", "success")
                 self.running = False
                 self.app.exit()
                 return
 
         if primary_cmd == "clear":
+            self._log_command(cmd, "clear", "success")
             self.logs = []
             self.logs_control.text = ANSI("")
             return
 
         if primary_cmd == "help":
+            self._log_command(cmd, "help", "success")
             self.log_message("[#00afaf]Available Commands:[/#]")
             self.log_message("  [bold]buy / sell [symbol|id] <qty|lotsL> [price] [product][/bold]")
             self.log_message("    e.g. [bold]sell 2L[/bold]               (2 lots of selected position)")
@@ -1768,6 +1873,7 @@ class KCLILiveSession:
             return
 
         if primary_cmd == "refresh":
+            self._log_command(cmd, "refresh", "success")
             self.log_message("Triggering manual refresh...")
             if hasattr(self, "app") and self.app and self.app.loop:
                 asyncio.run_coroutine_threadsafe(self._trigger_immediate_refresh(), self.app.loop)
@@ -1775,6 +1881,7 @@ class KCLILiveSession:
 
         # Deselect Command
         if primary_cmd == "deselect":
+            self._log_command(cmd, "deselect", "success")
             self.selected_symbol = None
             self.selected_account_name = None
             self.selected_account_api_key = None
@@ -1798,6 +1905,7 @@ class KCLILiveSession:
                     return
                 raw_acc = " ".join(parts[2:])
                 if raw_acc.lower() in ("none", "clear", "null", "empty", "all"):
+                    self._log_command(cmd, {"action": "clear_account_selection"}, "success")
                     self.selected_account_name = None
                     self.selected_account_api_key = None
                     self.selected_order = None
@@ -1807,6 +1915,7 @@ class KCLILiveSession:
                 
                 acct, err = self.resolve_account(raw_acc)
                 if err:
+                    self._log_command(cmd, {"action": "select_account", "query": raw_acc}, "error", err)
                     self.log_message(f"[#ff0000]Error:[/#] {err}")
                     return
                 
@@ -1814,6 +1923,7 @@ class KCLILiveSession:
                 self.selected_account_api_key = acct.get("api_key")
                 self.selected_order = None
                 self.update_prompt_label()
+                self._log_command(cmd, {"action": "select_account", "name": self.selected_account_name}, "success", api_key=self.selected_account_api_key)
                 self.log_message(f"Selected account: [bold]{self.selected_account_name}[/bold]. Orders will target this account only.")
                 return
 
@@ -1824,6 +1934,7 @@ class KCLILiveSession:
                     return
                 raw_ord = parts[2]
                 if raw_ord.lower() in ("none", "clear", "null", "empty"):
+                    self._log_command(cmd, {"action": "clear_order_selection"}, "success")
                     self.selected_order = None
                     self.update_prompt_label()
                     self.log_message("Order selection cleared.")
@@ -1831,6 +1942,7 @@ class KCLILiveSession:
                 
                 acct_and_order, err = self._find_pending_order(raw_ord)
                 if err:
+                    self._log_command(cmd, {"action": "select_order", "query": raw_ord}, "error", err)
                     self.log_message(f"[#ff0000]Error:[/#] {err}")
                     return
                 
@@ -1851,10 +1963,12 @@ class KCLILiveSession:
                 self.selected_symbol = None
                 
                 self.update_prompt_label()
+                self._log_command(cmd, {"action": "select_order", "order": self.selected_order}, "success", api_key=self.selected_order["api_key"])
                 self.log_message(f"Selected pending order [bold]{self.selected_order['order_id']}[/bold] ({self.selected_order['tradingsymbol']} | {self.selected_order['transaction_type']} | {self.selected_order['quantity']} @ {self.selected_order['price']:.2f}) on @{self.selected_order['account_name']}.")
                 return
                 
             if raw_id.lower() in ("none", "clear", "null", "empty"):
+                self._log_command(cmd, {"action": "clear_position_selection"}, "success")
                 self.selected_symbol = None
                 self.selected_account_name = None
                 self.selected_account_api_key = None
@@ -1865,6 +1979,7 @@ class KCLILiveSession:
 
             symbol, api_key, err = self.resolve_symbol(raw_id)
             if err:
+                self._log_command(cmd, {"action": "select_position", "query": raw_id}, "error", err)
                 self.log_message(f"[#ff0000]Error:[/#] {err}")
                 return
             
@@ -1878,6 +1993,12 @@ class KCLILiveSession:
                         break
                 
             self.update_prompt_label()
+            self._log_command(
+                cmd_text=cmd,
+                action={"action": "select_position", "symbol": symbol, "api_key": api_key},
+                status="success",
+                api_key=api_key,
+            )
             self.log_message(f"Selected {symbol} (@{self.selected_account_name or 'All Accounts'}). You can now type: [bold]buy|sell <qty> [price] [product][/bold] directly!")
             return
 
@@ -1952,6 +2073,13 @@ class KCLILiveSession:
                 "symbol": symbol
             }
             
+            self._log_command(
+                cmd_text=cmd,
+                action=self.pending_order,
+                status="pending_confirmation",
+                api_key=api_key,
+            )
+            
             self.prompt_control.text = f" Confirm MODIFY order {order_id[-6:]} to {qty_display} {symbol} {price_desc}? (y/n)> "
             self.log_message(f"[#ff8700]Pending Confirmation:[/#] MODIFY order {order_id} ({symbol}) to {qty_display} {price_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
             return
@@ -1989,6 +2117,13 @@ class KCLILiveSession:
                 "api_key": api_key,
                 "symbol": symbol
             }
+            
+            self._log_command(
+                cmd_text=cmd,
+                action=self.pending_order,
+                status="pending_confirmation",
+                api_key=api_key,
+            )
             
             self.prompt_control.text = f" Confirm CANCEL order {order_id[-6:]} ({tx_type} {qty} {symbol} {price_desc})? (y/n)> "
             self.log_message(f"[#ff8700]Pending Confirmation:[/#] CANCEL order {order_id} ({tx_type} {qty} {symbol} {price_desc}). Press [bold]y[/bold] to confirm, any other key to cancel.")
@@ -2130,6 +2265,19 @@ class KCLILiveSession:
             target_key = api_key or self.selected_account_api_key
             target_keys = [target_key] if target_key else []
 
+            if getattr(self, "_skip_confirmation", False):
+                asyncio.create_task(
+                    self.execute_order(
+                        symbol,
+                        primary_cmd,
+                        raw_qty_str,
+                        price_str,
+                        product,
+                        api_keys=target_keys
+                    )
+                )
+                return
+
             # Set pending order for confirmation (store resolved raw qty)
             self.pending_order = {
                 "symbol": symbol,
@@ -2150,6 +2298,14 @@ class KCLILiveSession:
                 accts_desc = ", ".join(names)
             else:
                 accts_desc = "All Accounts"
+
+            # Log pending buy/sell command
+            self._log_command(
+                cmd_text=cmd,
+                action=self.pending_order,
+                status="pending_confirmation",
+                api_key=target_keys[0] if len(target_keys) == 1 else None,
+            )
 
             price_desc = f"at price {price_str}" if price_str else "at MARKET"
             self.prompt_control.text = f" Confirm {primary_cmd.upper()} {qty_display} {symbol} ({product}) {price_desc} on {accts_desc}? (y/n)> "
@@ -2175,6 +2331,107 @@ class KCLILiveSession:
                 self.selected_account_api_key = None
                 self.update_prompt_label()
                 self.log_message("Selection cleared.")
+                return
+
+            if raw_symbol.lower() in ("near-week", "near"):
+                # Handle near-week option exit
+                target_key = self.selected_account_api_key
+                target_keys = [target_key] if target_key else [a["api_key"] for a in self.accounts]
+                
+                # Retrieve options database to resolve expiries
+                from cli.advisor import get_nifty_options
+                import datetime
+                
+                ref_key = None
+                for a in self.accounts:
+                    if self.client.is_authenticated(a["api_key"]):
+                        ref_key = a["api_key"]
+                        break
+                        
+                if not ref_key:
+                    self.log_message("[#ff0000]Error:[/#] No authenticated accounts to resolve expiries.")
+                    return
+                    
+                options = get_nifty_options(self.client, ref_key)
+                if not options:
+                    self.log_message("[#ff0000]Error:[/#] Failed to load options database.")
+                    return
+                    
+                today = datetime.date.today()
+                underlying_near_expiry = {}
+                for inst in options:
+                    name = inst.get("name")
+                    expiry = inst.get("expiry")
+                    if name and isinstance(expiry, datetime.date) and expiry >= today:
+                        if name not in underlying_near_expiry:
+                            underlying_near_expiry[name] = expiry
+                        else:
+                            underlying_near_expiry[name] = min(underlying_near_expiry[name], expiry)
+                            
+                # Scan active positions matching near expiry
+                target_symbols = set()
+                accounts_data = []
+                if self.last_positions_response:
+                    accounts_data = self.last_positions_response.get("accounts", [])
+                    
+                for acct in accounts_data:
+                    if acct.get("api_key") not in target_keys:
+                        continue
+                    for pos in acct.get("positions", []):
+                        if pos.get("quantity", 0) == 0:
+                            continue
+                        sym = pos.get("tradingsymbol", "")
+                        inst = next((x for x in options if x.get("tradingsymbol") == sym), None)
+                        if inst:
+                            name = inst.get("name")
+                            exp = inst.get("expiry")
+                            if exp == underlying_near_expiry.get(name):
+                                target_symbols.add(sym)
+                                
+                if not target_symbols:
+                    self.log_message("No open near-week option positions found.")
+                    return
+                    
+                symbols_list = sorted(list(target_symbols))
+                if getattr(self, "_skip_confirmation", False):
+                    for sym in symbols_list:
+                        asyncio.create_task(self.execute_exit(sym, target_keys))
+                    return
+
+                self.pending_order = {
+                    "type": "exit_near_week",
+                    "symbols": symbols_list,
+                    "api_keys": target_keys
+                }
+                
+                if self.selected_account_name:
+                    accts_desc = f"@{self.selected_account_name}"
+                else:
+                    accts_desc = "All Accounts"
+                    
+                # Log pending command
+                self._log_command(
+                    cmd_text=cmd,
+                    action=self.pending_order,
+                    status="pending_confirmation",
+                    api_key=target_keys[0] if len(target_keys) == 1 else None,
+                )
+                
+                self.prompt_control.text = f" Confirm SQUAREOFF {', '.join(symbols_list)} on {accts_desc}? (y/n)> "
+                self.log_message(f"[#ff8700]Pending Confirmation:[/#] SQUAREOFF {', '.join(symbols_list)} on {accts_desc}. Press [bold]y[/bold] to confirm.")
+                return
+
+            if getattr(self, "_skip_confirmation", False):
+                target_key = self.selected_account_api_key
+                if raw_symbol and raw_symbol.lower() != "all":
+                    symbol, api_key, err = self.resolve_symbol(raw_symbol)
+                    if err:
+                        self.log_message(f"[#ff0000]Error:[/#] {err}")
+                        return
+                    target_key = api_key or self.selected_account_api_key
+                    asyncio.create_task(self.execute_exit(symbol, [target_key] if target_key else []))
+                else:
+                    asyncio.create_task(self.execute_exit(None, [target_key] if target_key else []))
                 return
 
             # Set pending exit for confirmation
@@ -2211,6 +2468,14 @@ class KCLILiveSession:
                 accts_desc = ", ".join(names)
             else:
                 accts_desc = "All Accounts"
+
+            # Log pending exit command
+            self._log_command(
+                cmd_text=cmd,
+                action=self.pending_order,
+                status="pending_confirmation",
+                api_key=target_keys[0] if len(target_keys) == 1 else None,
+            )
 
             if raw_symbol and raw_symbol.lower() != "all":
                 symbol = self.pending_order["symbol"]
@@ -2415,6 +2680,143 @@ class KCLILiveSession:
         if hasattr(self, "app") and self.app:
             self.app.invalidate()
 
+    def _render_advisor_text(self) -> str:
+        """Render Tuesday strangle advisor plan into plain text."""
+        import datetime
+        
+        today = datetime.date.today()
+        is_tuesday = today.weekday() == 1
+        
+        if not is_tuesday:
+            return "=== Tuesday Expiry Option Strangle Advisor ===\n\n[INFO] Today is not Tuesday. Expiry strangle planning is only active on Tuesdays."
+
+        from cli.advisor import generate_tuesday_plan
+
+        # Fetch live Nifty spot price
+        nifty_spot = self.index_values.get("nifty")
+
+        accounts_positions = []
+        if self.last_positions_response:
+            accounts_positions = self.last_positions_response.get("accounts", [])
+
+        try:
+            plan = generate_tuesday_plan(
+                client=self.client,
+                accounts_positions=accounts_positions,
+                margins_by_api_key=self.margins_by_api_key,
+                api_key_to_user_id=self.api_key_to_user_id,
+                nifty_spot=nifty_spot
+            )
+        except Exception as exc:
+            return f"=== Tuesday Expiry Advisor ===\n\nFailed to plan: {exc}"
+
+        if plan.get("status") == "error":
+            return f"=== Tuesday Expiry Advisor ===\n\nError: {plan.get('message')}"
+
+        lines = []
+
+        lines.append("=== Tuesday Expiry Option Strangle Advisor ===")
+        spot_desc = f"{plan.get('nifty_spot'):,.2f}" if plan.get('nifty_spot') else "N/A"
+        lines.append(f"NIFTY Index Spot: {spot_desc}")
+
+        exp = plan.get("expiries", {})
+        lines.append(f"Expiries: E0={exp.get('E0')} | E1={exp.get('E1')} | E2={exp.get('E2')}")
+
+        strikes = plan.get("strikes", {})
+        symbols = plan.get("symbols", {})
+        lines.append("Target Strikes:")
+        lines.append(f"  - E1 (5% OTM) CE: {strikes.get('E1_CE')} ({symbols.get('E1_CE') or 'NOT FOUND'})")
+        lines.append(f"  - E1 (5% OTM) PE: {strikes.get('E1_PE')} ({symbols.get('E1_PE') or 'NOT FOUND'})")
+        lines.append(f"  - E2 (7% OTM) CE: {strikes.get('E2_CE')} ({symbols.get('E2_CE') or 'NOT FOUND'})")
+        lines.append(f"  - E2 (7% OTM) PE: {strikes.get('E2_PE')} ({symbols.get('E2_PE') or 'NOT FOUND'})")
+        lines.append("-" * 75)
+        lines.append("")
+
+        for acct in plan.get("accounts", []):
+            lines.append(f"Account: {acct.get('name')} ({acct.get('user_id')})")
+            lines.append(f"  Margin: Cash={acct.get('cash')/100000:.2f}L | Collateral={acct.get('collateral')/100000:.2f}L | Total={acct.get('total_capital')/100000:.2f}L")
+            lines.append(f"  Allocated (50/50): E1={acct.get('lots_e1')} Lots (~{acct.get('lots_e1')*1.3:.1f}L) | E2={acct.get('lots_e2')} Lots (~{acct.get('lots_e2')*1.3:.1f}L)")
+
+            ex_e0 = acct.get("exits_e0", [])
+            ex_e1 = acct.get("exits_e1", [])
+            lines.append(f"  Exits to Execute: E0={ex_e0 or '(none)'} | E1={ex_e1 or '(none)'}")
+
+            lines.append("")
+            lines.append("  [Stage 1 Command (E0/E1 Exits + E1 Entry - 5% OTM)]")
+            if acct.get("stage_1_cmd"):
+                lines.append(f"  > {acct.get('stage_1_cmd')}")
+            else:
+                lines.append("  > (no action needed or insufficient capital)")
+
+            lines.append("")
+            lines.append("  [Stage 2 Command (E2 Entry - 7% OTM - ONLY if margin > 3L after Stage 1)]")
+            if acct.get("stage_2_cmd"):
+                lines.append(f"  > {acct.get('stage_2_cmd')}")
+            else:
+                lines.append("  > (no action or insufficient capital)")
+
+            lines.append("-" * 75)
+            lines.append("")
+
+        return "\n".join(lines)
+
+    async def resolve_nli_command(self, user_text: str) -> None:
+        """Call Gemini NLI to translate natural language string, then stage confirmation."""
+        if not getattr(self, "gemini_api_key", None):
+            self.log_message("[#ff0000]Error:[/#] Gemini API Key is missing. Please add 'gemini_api_key' to ~/.kcli/config.yaml or set GEMINI_API_KEY env var.")
+            return
+
+        self.log_message(f"[#d787ff]Translating NLI command via Gemini: \"{user_text}\"...[/#]")
+
+        # Build context
+        selected_acct = self.selected_account_name
+        accounts_list = [a.get("name") for a in self.accounts]
+
+        # Get open positions (from active_positions list)
+        open_positions = getattr(self, "active_positions", [])
+        nifty_spot = self.index_values.get("nifty")
+
+        from cli.nli import parse_natural_language
+
+        try:
+            result = await parse_natural_language(
+                api_key=self.gemini_api_key,
+                user_input=user_text,
+                selected_account=selected_acct,
+                accounts_list=accounts_list,
+                open_positions=open_positions,
+                nifty_spot=nifty_spot
+            )
+        except Exception as exc:
+            self.log_message(f"[#ff0000]NLI Translation Failed:[/#] {exc}")
+            return
+
+        translated_cmd = result.get("command", "").strip()
+        explanation = result.get("explanation", "").strip()
+        confidence = result.get("confidence", 0.0)
+
+        if not translated_cmd:
+            self.log_message(f"[#ff5555]NLI Translation Failed:[/#] Could not interpret query. ({explanation or 'Low confidence'})")
+            return
+
+        # Stage confirmation
+        self.pending_order = {
+            "type": "nli_command",
+            "command": translated_cmd,
+            "explanation": explanation
+        }
+
+        # Log pending command status
+        self._log_command(
+            cmd_text=f"/{user_text}",
+            action=self.pending_order,
+            status="pending_confirmation",
+            api_key=self.selected_account_api_key
+        )
+
+        self.prompt_control.text = f" Confirm NLI Action: {translated_cmd}? (y/n)> "
+        self.log_message(f"[#d787ff]Pending Translation:[/#] \"{translated_cmd}\" ({explanation}, conf={confidence:.2f}). Press [bold]y[/bold] to confirm.")
+
 
     def _render_orders_pane(self, response: dict, mode: str) -> str:
         """Render pending or executed orders from a /api/orders response into plain text."""
@@ -2485,6 +2887,12 @@ class KCLILiveSession:
             text = self._last_pending_text
         elif self.info_mode == "orders_executed":
             text = self._last_executed_text
+        elif self.info_mode == "advisor":
+            try:
+                self._last_advisor_text = self._render_advisor_text()
+            except Exception as exc:
+                self._last_advisor_text = f"=== Tuesday Expiry Advisor ===\n\nFailed to plan: {exc}"
+            text = self._last_advisor_text
         else:
             text = self._last_oc_text
         self.info_buffer.set_document(
@@ -2859,6 +3267,11 @@ class KCLILiveSession:
             self.info_mode = "oc"
             self._update_info_buffer()
 
+        @kb.add("f4")
+        def _f4(event):
+            self.info_mode = "advisor"
+            self._update_info_buffer()
+
         # Ctrl+Left/Right — adjust left/right pane split
         @kb.add("c-left")
         def _narrow_left(event):
@@ -2951,7 +3364,7 @@ class KCLILiveSession:
                 self.vertical_divider,
                 # ── RIGHT half: Info Pane (scrollable) ──
                 Frame(
-                    title="[F1] Pending  [F2] Executed  [F3] Option Chain [Ctrl+←→: resize]",
+                    title="[F1] Pending  [F2] Executed  [F3] Option Chain  [F4] Advisor  [Ctrl+←→: resize]",
                     body=HSplit([
                         Window(
                             content=self.market_indices_control,
@@ -2982,10 +3395,10 @@ class KCLILiveSession:
                         content=self.prompt_control,
                         dont_extend_width=True,
                         style="class:prompt_label",
-                        height=1,
+                        wrap_lines=True,
                     ),
                     self.input_field,
-                ], height=1),
+                ], height=3),
             ]),
             focused_element=self.input_field,
         )
@@ -3004,6 +3417,11 @@ class KCLILiveSession:
             await self.app.run_async()
         finally:
             self.running = False
+            if hasattr(self, "recorder"):
+                try:
+                    self.recorder.stop()
+                except Exception as exc:
+                    logger.error("Error stopping recorder: %s", exc, exc_info=True)
             for api_key, ticker in list(self.tickers.items()):
                 try:
                     ticker.close()

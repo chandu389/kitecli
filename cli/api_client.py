@@ -31,14 +31,17 @@ class KCLIClient:
     def __init__(self, accounts: list[dict]) -> None:
         self._accounts = accounts
         self._api_keys = [a.get("api_key", "") for a in accounts]
-        # Eagerly init all accounts (restores saved sessions if available)
-        for acct in accounts:
+        # Eagerly init all accounts in parallel (restores saved sessions if available)
+        def init_one(acct):
             _manager.init_account(
                 api_key=acct.get("api_key", ""),
                 api_secret=acct.get("api_secret", ""),
                 name=acct.get("name", ""),
                 proxy=acct.get("proxy"),
             )
+
+        with ThreadPoolExecutor(max_workers=max(1, len(accounts))) as executor:
+            list(executor.map(init_one, accounts))
 
     # ── compatibility helpers ──────────────────────────────────────
 
@@ -109,6 +112,20 @@ class KCLIClient:
             results = list(executor.map(init_one, accounts))
 
         return {"accounts": results}
+
+    def is_authenticated(self, api_key: str) -> bool:
+        """Check if the given account is authenticated."""
+        return _manager.is_authenticated(api_key)
+
+    def login(self, api_key: str, request_token: str) -> dict:
+        """Complete Kite OAuth login with a request token."""
+        try:
+            success = _manager.complete_login(api_key, request_token.strip())
+            if success:
+                return {"status": "success", "message": "Login successful"}
+            return {"status": "error", "message": "Login failed — check request_token"}
+        except Exception as exc:
+            raise KCLIClientError(str(exc)) from exc
 
     def complete_callback(self, api_key: str, request_token: str) -> dict:
         """Complete Kite OAuth login with a request token."""
@@ -192,7 +209,7 @@ class KCLIClient:
                     "message": "Account not authenticated",
                 }
             try:
-                order_id = _manager.place_order(
+                order_ids = _manager.place_order(
                     api_key=api_key,
                     tradingsymbol=tradingsymbol,
                     exchange=exchange,
@@ -203,12 +220,15 @@ class KCLIClient:
                     trigger_price=trigger_price,
                     product=product,
                 )
+                ids_str = ", ".join(order_ids)
                 return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,
                     "status": "success",
-                    "order_id": str(order_id),
-                    "message": f"Order placed: {order_id}",
+                    "order_id": ids_str,
+                    "order_ids": order_ids,
+                    "legs": len(order_ids),
+                    "message": f"Order placed: {ids_str}" if len(order_ids) == 1 else f"Order split into {len(order_ids)} legs: {ids_str}",
                 }
             except Exception as exc:
                 return {
@@ -374,7 +394,12 @@ class KCLIClient:
 
         def fetch_one(api_key):
             result = _manager.get_margins(api_key)
-            return {"api_key": api_key, "net": result["net"], "cash": result["cash"]}
+            return {
+                "api_key": api_key,
+                "net": result["net"],
+                "cash": result["cash"],
+                "collateral": result.get("collateral")
+            }
 
         with ThreadPoolExecutor(max_workers=max(1, len(keys))) as executor:
             results = list(executor.map(fetch_one, keys))

@@ -1,0 +1,321 @@
+"""
+SQLite-backed data recording subsystem for KiteCLI.
+
+Records order updates, position snapshots, and user commands asynchronously
+on a background thread to prevent TUI rendering blocks.
+"""
+
+import json
+import logging
+import queue
+import sqlite3
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger("kitecli.recorder")
+
+
+class DataRecorder:
+    """Manages asynchronous batch persistence of trading logs to SQLite."""
+
+    def __init__(self, db_path: Path | None = None) -> None:
+        if db_path is None:
+            self.db_path = Path.home() / ".kcli" / "data.db"
+        else:
+            self.db_path = Path(db_path)
+
+        self._queue: queue.Queue = queue.Queue()
+        self._thread: threading.Thread | None = None
+        self._running = False
+
+    def start(self) -> None:
+        """Start the background recorder thread."""
+        if self._running:
+            return
+
+        self._running = True
+        self._thread = threading.Thread(
+            target=self._worker_loop,
+            name="KCLIDataRecorder",
+            daemon=True,
+        )
+        self._thread.start()
+        logger.info("DataRecorder thread started.")
+
+    def stop(self) -> None:
+        """Gracefully stop the background recorder thread and flush pending items."""
+        if not self._running:
+            return
+
+        self._running = False
+        # Send sentinel to unblock worker
+        self._queue.put(None)
+        if self._thread:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+        logger.info("DataRecorder thread stopped.")
+
+    def enqueue_order(self, order_data: dict[str, Any], index_values: dict[str, Any], user_id: str) -> None:
+        """Enqueue an order update for logging."""
+        self._queue.put({
+            "type": "order",
+            "timestamp": datetime.now().isoformat(),
+            "user_id": user_id,
+            "order_data": order_data,
+            "index_values": index_values,
+        })
+
+    def enqueue_positions(self, positions: list[dict[str, Any]], index_values: dict[str, Any], user_id: str) -> None:
+        """Enqueue a list of positions for logging."""
+        self._queue.put({
+            "type": "positions",
+            "timestamp": datetime.now().isoformat(),
+            "user_id": user_id,
+            "positions": positions,
+            "index_values": index_values,
+        })
+
+    def enqueue_command(
+        self,
+        command_text: str,
+        parsed_action: str,
+        status: str,
+        result_message: str | None,
+        index_values: dict[str, Any],
+        user_id: str | None = None,
+    ) -> None:
+        """Enqueue a user command execution log."""
+        self._queue.put({
+            "type": "command",
+            "timestamp": datetime.now().isoformat(),
+            "user_id": user_id,
+            "command_text": command_text,
+            "parsed_action": parsed_action,
+            "status": status,
+            "result_message": result_message,
+            "index_values": index_values,
+        })
+
+    def _init_db(self, conn: sqlite3.Connection) -> None:
+        """Initialise database tables and enable WAL mode."""
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+
+        # Create orders table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                order_id TEXT NOT NULL,
+                parent_order_id TEXT,
+                tradingsymbol TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                transaction_type TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                order_type TEXT NOT NULL,
+                price REAL,
+                trigger_price REAL,
+                average_price REAL,
+                status TEXT NOT NULL,
+                status_message TEXT,
+                nifty REAL,
+                sensex REAL,
+                vix REAL
+            );
+        """)
+
+        # Create position snapshots table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS position_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                tradingsymbol TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                average_price REAL NOT NULL,
+                last_price REAL NOT NULL,
+                pnl REAL NOT NULL,
+                realised REAL NOT NULL,
+                unrealised REAL NOT NULL,
+                nifty REAL,
+                sensex REAL,
+                vix REAL
+            );
+        """)
+
+        # Create user commands table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_commands (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                user_id TEXT,
+                command_text TEXT NOT NULL,
+                parsed_action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                result_message TEXT,
+                nifty REAL,
+                sensex REAL,
+                vix REAL
+            );
+        """)
+        conn.commit()
+
+    def _worker_loop(self) -> None:
+        """Background thread worker loop that processes and batch-saves queued logs."""
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(self.db_path))
+            self._init_db(conn)
+        except Exception as exc:
+            logger.error("Failed to initialize database: %s", exc, exc_info=True)
+            return
+
+        try:
+            while True:
+                # Blocks until an item is available
+                item = self._queue.get()
+                if item is None:
+                    # Sentinel received, exit thread
+                    self._queue.task_done()
+                    break
+
+                # Gather any other immediately available items to write in a single batch
+                batch = [item]
+                while not self._queue.empty():
+                    try:
+                        next_item = self._queue.get_nowait()
+                        if next_item is None:
+                            # Sentinel found, we should stop after this batch
+                            self._queue.task_done()
+                            self._running = False
+                            break
+                        batch.append(next_item)
+                    except queue.Empty:
+                        break
+
+                # Process the gathered batch within a single transaction
+                try:
+                    self._write_batch(conn, batch)
+                except Exception as exc:
+                    logger.error("Error writing batch to DB: %s", exc, exc_info=True)
+
+                # Mark all processed items as done
+                for _ in range(len(batch)):
+                    self._queue.task_done()
+
+                if not self._running:
+                    break
+
+        finally:
+            try:
+                # Final flush of any items that arrived right during shutdown
+                final_batch = []
+                while not self._queue.empty():
+                    try:
+                        next_item = self._queue.get_nowait()
+                        if next_item is not None:
+                            final_batch.append(next_item)
+                        self._queue.task_done()
+                    except queue.Empty:
+                        break
+                if final_batch:
+                    self._write_batch(conn, final_batch)
+            except Exception as exc:
+                logger.error("Error during final database flush: %s", exc, exc_info=True)
+            finally:
+                conn.close()
+
+    def _write_batch(self, conn: sqlite3.Connection, batch: list[dict[str, Any]]) -> None:
+        """Write a batch of items to the database in a transaction."""
+        cursor = conn.cursor()
+        for item in batch:
+            item_type = item.get("type")
+            ts = item.get("timestamp")
+            user_id = item.get("user_id")
+            indices = item.get("index_values", {})
+            nifty = indices.get("nifty")
+            sensex = indices.get("sensex")
+            vix = indices.get("vix")
+
+            if item_type == "order":
+                o = item.get("order_data", {})
+                cursor.execute(
+                    """
+                    INSERT INTO orders (
+                        timestamp, user_id, order_id, parent_order_id, tradingsymbol, exchange,
+                        transaction_type, quantity, order_type, price, trigger_price,
+                        average_price, status, status_message, nifty, sensex, vix
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ts,
+                        user_id,
+                        str(o.get("order_id", "")),
+                        o.get("parent_order_id"),
+                        o.get("tradingsymbol", ""),
+                        o.get("exchange", ""),
+                        o.get("transaction_type", ""),
+                        int(o.get("quantity", 0)),
+                        o.get("order_type", ""),
+                        o.get("price"),
+                        o.get("trigger_price"),
+                        o.get("average_price"),
+                        o.get("status", ""),
+                        o.get("status_message"),
+                        nifty,
+                        sensex,
+                        vix,
+                    ),
+                )
+
+            elif item_type == "positions":
+                positions_list = item.get("positions", [])
+                for p in positions_list:
+                    cursor.execute(
+                        """
+                        INSERT INTO position_snapshots (
+                            timestamp, user_id, tradingsymbol, exchange, quantity,
+                            average_price, last_price, pnl, realised, unrealised, nifty, sensex, vix
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ts,
+                            user_id,
+                            p.get("tradingsymbol", ""),
+                            p.get("exchange", ""),
+                            int(p.get("quantity", 0)),
+                            float(p.get("average_price", 0.0)),
+                            float(p.get("last_price", 0.0)),
+                            float(p.get("pnl", 0.0)),
+                            float(p.get("realised", 0.0)),
+                            float(p.get("unrealised", 0.0)),
+                            nifty,
+                            sensex,
+                            vix,
+                        ),
+                    )
+
+            elif item_type == "command":
+                cursor.execute(
+                    """
+                    INSERT INTO user_commands (
+                        timestamp, user_id, command_text, parsed_action, status, result_message, nifty, sensex, vix
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ts,
+                        user_id,
+                        item.get("command_text", ""),
+                        item.get("parsed_action", ""),
+                        item.get("status", ""),
+                        item.get("result_message"),
+                        nifty,
+                        sensex,
+                        vix,
+                    ),
+                )
+        conn.commit()
