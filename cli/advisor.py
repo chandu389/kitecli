@@ -222,20 +222,27 @@ def generate_tuesday_plan(
             inst = next((x for x in options if x.get("tradingsymbol") == symbol), None)
             if inst:
                 exp = inst.get("expiry")
+                lp = pos.get("last_price")
+                try:
+                    p_val = float(lp) if lp is not None else 0.0
+                    p_str = f" {p_val:.2f}" if p_val > 0 else ""
+                except (ValueError, TypeError):
+                    p_str = ""
+
                 if exp == E0:
-                    exits_e0.append(symbol)
+                    exits_e0.append((symbol, p_str))
                 elif exp == E1:
-                    exits_e1.append(symbol)
+                    exits_e1.append((symbol, p_str))
 
         # Build Stage 1 command
         # Syntax: account <name> && exit <pos1> && exit <pos2> && sell <CE> <lots>L && sell <PE> <lots>L
         stage_1_parts = [f"account {name}"]
         
         # Add exit commands
-        for sym in exits_e0:
-            stage_1_parts.append(f"exit {sym}")
-        for sym in exits_e1:
-            stage_1_parts.append(f"exit {sym}")
+        for sym, p_str in exits_e0:
+            stage_1_parts.append(f"exit {sym}{p_str}")
+        for sym, p_str in exits_e1:
+            stage_1_parts.append(f"exit {sym}{p_str}")
             
         # Add new E1 entries if lots > 0 and symbols resolved
         if lots_e1 > 0:
@@ -266,8 +273,8 @@ def generate_tuesday_plan(
             "trading_capital": trading_capital,
             "lots_e1": lots_e1,
             "lots_e2": lots_e2,
-            "exits_e0": exits_e0,
-            "exits_e1": exits_e1,
+            "exits_e0": [x[0] for x in exits_e0],
+            "exits_e1": [x[0] for x in exits_e1],
             "stage_1_cmd": stage_1_cmd,
             "stage_2_cmd": stage_2_cmd
         }

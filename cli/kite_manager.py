@@ -570,6 +570,7 @@ class KiteAccountManager:
         self,
         api_key: str,
         tradingsymbol: str | None = None,
+        price: float | None = None,
     ) -> list[dict[str, Any]]:
         """Exit/square off open positions for a specific account.
 
@@ -577,6 +578,7 @@ class KiteAccountManager:
             api_key: The Kite Connect API key.
             tradingsymbol: If specified, only square off positions matching this symbol.
                            If None, square off all open positions.
+            price: If specified, place limit orders at this price. If None, place market orders.
 
         Returns:
             A list of details of placed exit orders:
@@ -638,7 +640,8 @@ class KiteAccountManager:
                     exchange=exchange,
                     transaction_type=transaction_type,
                     quantity=exit_qty,
-                    order_type=kite.ORDER_TYPE_MARKET,
+                    order_type=kite.ORDER_TYPE_LIMIT if price is not None else kite.ORDER_TYPE_MARKET,
+                    price=price,
                     product=product,
                 )
                 for order_id in order_ids:

@@ -248,6 +248,7 @@ class KCLIClient:
         self,
         api_keys: list[str],
         tradingsymbol: str | None = None,
+        price: float | None = None,
     ) -> dict:
         """Exit positions across specified accounts in parallel."""
         keys = api_keys or _manager.get_all_api_keys()
@@ -263,7 +264,7 @@ class KCLIClient:
                     "orders_placed": [],
                 }
             try:
-                orders = _manager.exit_positions(api_key, tradingsymbol)
+                orders = _manager.exit_positions(api_key, tradingsymbol, price)
                 return {
                     "name": info.get("name", api_key),
                     "api_key": api_key,

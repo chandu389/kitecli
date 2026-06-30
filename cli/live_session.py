@@ -636,17 +636,27 @@ class KCLILiveSession:
                                         name = inst.get("name")
                                         exp = inst.get("expiry")
                                         if exp == underlying_near_expiry.get(name):
-                                            acct_exits.append(sym_name)
+                                            lp = pos.get("last_price")
+                                            try:
+                                                p_val = float(lp) if lp is not None else 0.0
+                                                p_str = f" {p_val:.2f}" if p_val > 0 else ""
+                                            except (ValueError, TypeError):
+                                                p_str = ""
+                                            acct_exits.append((sym_name, p_str))
                                 
                                 if acct_exits:
                                     if not target_key:
                                         squareoff_parts.append(f"account {a_name}")
-                                    for sym_name in acct_exits:
-                                        squareoff_parts.append(f"exit {sym_name}")
+                                    for sym_name, p_str in acct_exits:
+                                        squareoff_parts.append(f"exit {sym_name}{p_str}")
             except Exception:
                 pass
 
-            squareoff_snippet = " && ".join(squareoff_parts) if squareoff_parts else "exit near-week"
+            if sym:
+                # Target selected position with limit price
+                squareoff_snippet = f"exit {sym}{price_str}"
+            else:
+                squareoff_snippet = " && ".join(squareoff_parts) if squareoff_parts else "exit near-week"
 
             # ── button definitions: (label, active_style, dim_style, snippet) ──
             buttons = [
@@ -1634,13 +1644,16 @@ class KCLILiveSession:
         except Exception as exc:
             self.log_message(f"[#ff0000]Unexpected Error:[/#] {exc}")
 
-    async def execute_exit(self, symbol: str = None, api_keys: list[str] = []) -> None:
+    async def execute_exit(self, symbol: str = None, api_keys: list[str] = [], price: float | None = None) -> None:
         """Execute exit of positions across specified accounts in executor."""
+        if symbol and symbol.lower() == "all":
+            symbol = None
         accts_desc = f"account {self.selected_account_name}" if (api_keys and hasattr(self, "selected_account_name") and self.selected_account_name) else "all accounts"
+        price_desc = f" @{price:.2f}" if price is not None else ""
         if symbol:
-            self.log_message(f"Exiting open positions for {symbol} across {accts_desc}...")
+            self.log_message(f"Exiting open positions for {symbol} across {accts_desc}{price_desc}...")
         else:
-            self.log_message(f"Exiting ALL open positions across {accts_desc}...")
+            self.log_message(f"Exiting ALL open positions across {accts_desc}{price_desc}...")
 
         try:
             # Place exit request on server
@@ -1648,6 +1661,7 @@ class KCLILiveSession:
                 self.client.exit_positions,
                 api_keys=api_keys,
                 tradingsymbol=symbol,
+                price=price,
             )
 
             # Print exit results
@@ -1807,10 +1821,10 @@ class KCLILiveSession:
                     api_key=p.get("api_key") if p.get("api_key") else (p.get("api_keys")[0] if p.get("api_keys") else None),
                 )
                 if p["type"] == "exit":
-                    asyncio.create_task(self.execute_exit(p["symbol"], p.get("api_keys", [])))
+                    asyncio.create_task(self.execute_exit(p["symbol"], p.get("api_keys", []), p.get("price")))
                 elif p["type"] == "exit_near_week":
                     for sym in p["symbols"]:
-                        asyncio.create_task(self.execute_exit(sym, p.get("api_keys", [])))
+                        asyncio.create_task(self.execute_exit(sym, p.get("api_keys", []), p.get("price")))
                 elif p["type"] == "modify":
                     asyncio.create_task(
                         self.execute_modify(
@@ -2370,14 +2384,33 @@ class KCLILiveSession:
 
         # Exit Positions Command
         if primary_cmd == "exit":
+            price_val = None
             if len(parts) < 2:
                 if hasattr(self, "selected_symbol") and self.selected_symbol:
                     raw_symbol = self.selected_symbol
                 else:
-                    self.log_message("[#ff0000]Usage:[/#] exit <symbol|id> OR exit all")
+                    self.log_message("[#ff0000]Usage:[/#] exit <symbol|id> [price] OR exit all [price]")
                     return
             else:
-                raw_symbol = " ".join(parts[1:])
+                last_part = parts[-1]
+                is_numeric = False
+                try:
+                    if last_part.replace(".", "", 1).isdigit() and not last_part.isalpha():
+                        is_numeric = True
+                except Exception:
+                    pass
+
+                if is_numeric:
+                    if len(parts) == 2 and hasattr(self, "selected_symbol") and self.selected_symbol:
+                        price_val = float(last_part)
+                        raw_symbol = self.selected_symbol
+                    elif len(parts) >= 3:
+                        price_val = float(last_part)
+                        raw_symbol = " ".join(parts[1:-1])
+                    else:
+                        raw_symbol = " ".join(parts[1:])
+                else:
+                    raw_symbol = " ".join(parts[1:])
 
             # If the user typed "exit none" or "exit clear", they want to clear/exit the selection context
             if raw_symbol.lower() in ("none", "clear"):
@@ -2450,13 +2483,14 @@ class KCLILiveSession:
                 symbols_list = sorted(list(target_symbols))
                 if getattr(self, "_skip_confirmation", False):
                     for sym in symbols_list:
-                        asyncio.create_task(self.execute_exit(sym, target_keys))
+                        asyncio.create_task(self.execute_exit(sym, target_keys, price_val))
                     return
 
                 self.pending_order = {
                     "type": "exit_near_week",
                     "symbols": symbols_list,
-                    "api_keys": target_keys
+                    "api_keys": target_keys,
+                    "price": price_val,
                 }
                 
                 if self.selected_account_name:
@@ -2464,6 +2498,8 @@ class KCLILiveSession:
                 else:
                     accts_desc = "All Accounts"
                     
+                price_desc = f" @{price_val:.2f}" if price_val is not None else ""
+                
                 # Log pending command
                 self._log_command(
                     cmd_text=cmd,
@@ -2472,8 +2508,8 @@ class KCLILiveSession:
                     api_key=target_keys[0] if len(target_keys) == 1 else None,
                 )
                 
-                self.prompt_control.text = f" Confirm SQUAREOFF {', '.join(symbols_list)} on {accts_desc}? (y/n)> "
-                self.log_message(f"[#ff8700]Pending Confirmation:[/#] SQUAREOFF {', '.join(symbols_list)} on {accts_desc}. Press [bold]y[/bold] to confirm.")
+                self.prompt_control.text = f" Confirm SQUAREOFF {', '.join(symbols_list)} on {accts_desc}{price_desc}? (y/n)> "
+                self.log_message(f"[#ff8700]Pending Confirmation:[/#] SQUAREOFF {', '.join(symbols_list)} on {accts_desc}{price_desc}. Press [bold]y[/bold] to confirm.")
                 return
 
             if getattr(self, "_skip_confirmation", False):
@@ -2484,9 +2520,9 @@ class KCLILiveSession:
                         self.log_message(f"[#ff0000]Error:[/#] {err}")
                         return
                     target_key = api_key or self.selected_account_api_key
-                    asyncio.create_task(self.execute_exit(symbol, [target_key] if target_key else []))
+                    asyncio.create_task(self.execute_exit(symbol, [target_key] if target_key else [], price_val))
                 else:
-                    asyncio.create_task(self.execute_exit(None, [target_key] if target_key else []))
+                    asyncio.create_task(self.execute_exit(None, [target_key] if target_key else [], price_val))
                 return
 
             # Set pending exit for confirmation
@@ -2494,7 +2530,7 @@ class KCLILiveSession:
                 "symbol": raw_symbol,
                 "type": "exit",
                 "qty": "",
-                "price": "",
+                "price": price_val,
                 "product": ""
             }
 
@@ -2532,13 +2568,14 @@ class KCLILiveSession:
                 api_key=target_keys[0] if len(target_keys) == 1 else None,
             )
 
+            price_desc = f" @{price_val:.2f}" if price_val is not None else ""
             if raw_symbol and raw_symbol.lower() != "all":
                 symbol = self.pending_order["symbol"]
-                self.prompt_control.text = f" Confirm EXIT of {symbol} on {accts_desc}? (y/n)> "
-                self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT open positions for {symbol} on {accts_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+                self.prompt_control.text = f" Confirm EXIT of {symbol} on {accts_desc}{price_desc}? (y/n)> "
+                self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT open positions for {symbol} on {accts_desc}{price_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
             else:
-                self.prompt_control.text = f" Confirm EXIT of ALL positions on {accts_desc}? (y/n)> "
-                self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT ALL open positions on {accts_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
+                self.prompt_control.text = f" Confirm EXIT of ALL positions on {accts_desc}{price_desc}? (y/n)> "
+                self.log_message(f"[#ff8700]Pending Confirmation:[/#] EXIT ALL open positions on {accts_desc}{price_desc}. Press [bold]y[/bold] to confirm, any other key to cancel.")
             return
 
         # Option Chain Command
